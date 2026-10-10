@@ -151,6 +151,7 @@ class Daemon:
         requested = request.get("tray") if isinstance(request.get("tray"), str) else "auto"
         tray = managed_tray(requested)
         verbose = bool(request.get("verbose"))
+        extra = _env_map(request.get("env"))
         status = self._call({"op": "status"})
         raw = status.get("instances")
         if isinstance(raw, dict) and name in raw:
@@ -183,7 +184,7 @@ class Daemon:
                     "op": "spawn",
                     "name": name,
                     "argv": clippon_argv(name, list(command), resolution, verbose),
-                    "env": _child_env(sink, audio, tray),
+                    "env": _child_env(sink, audio, tray, extra),
                     "stdout": str(log_path),
                 }
             )
@@ -286,13 +287,37 @@ class Daemon:
         self._stop = True
 
 
-def _child_env(sink: str, audio: str, tray: str) -> dict[str, str]:
+def _child_env(sink: str, audio: str, tray: str, extra: dict[str, str]) -> dict[str, str]:
+    """The environment the session runs with.
+
+    *extra* is what `clipponctl start --env` asked for: it lands in the
+    environment of the session's clippon process, which passes it on to cage
+    and to the program cage starts. The STREAM_* names below are set after it,
+    so the daemon keeps deciding the sink, the audio mode and the tray, and
+    LD_PRELOAD is dropped so a caller cannot preload into the session.
+    """
     env = dict(os.environ)
+    env.update(extra)
     env["STREAM_SINK"] = sink
     env["STREAM_AUDIO"] = audio
     env["STREAM_TRAY"] = tray
     env.pop("LD_PRELOAD", None)
     return env
+
+
+def _env_map(raw: object) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ClipponError("env must be an object")
+    found: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ClipponError("env keys and values must be strings")
+        if not key or "\0" in key or "\0" in value:
+            raise ClipponError("env contains an invalid name or value")
+        found[key] = value
+    return found
 
 
 def _required_name(request: dict[str, object]) -> str:

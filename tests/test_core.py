@@ -13,7 +13,14 @@ from pathlib import Path
 
 from clippon.audio import AudioInstance, pipewire_dropin, wireplumber_dropin
 from clippon.cage import cage_environment, client_argv, wayland_socket_on_line
-from clippon.config import DEFAULT_RES, ClipponError, parse_args, resolution_ok
+from clippon.config import (
+    DEFAULT_RES,
+    SHIM_PATH,
+    ClipponError,
+    env_pair,
+    parse_args,
+    resolution_ok,
+)
 from clippon.ctl import format_list, parse_ctl
 from clippon.daemon import clippon_argv
 from clippon.gateway import (
@@ -640,6 +647,81 @@ u_str LISTEN 0      128         /run/user/1000/wayland-0 5111993      * 0    use
 u_str LISTEN 0      128         /run/user/1000/wayland-1 4474356      * 0    users:(("kwin_wayland_wr",pid=552957,fd=7))
 u_str LISTEN 0      1              @/tmp/.X11-unix/X1 4474358      * 0    users:(("Xwayland",pid=553013,fd=9))
 """
+
+
+class EnvOptionTests(unittest.TestCase):
+    """--env reaches cage and the program it starts, on both start paths."""
+
+    def test_env_options_are_collected_in_order(self) -> None:
+        cfg = parse_args(
+            [
+                "--env",
+                "GTK_IM_MODULE=fcitx",
+                "--env=XMODIFIERS=@im=fcitx",
+                "--",
+                "kitty",
+            ],
+            environ={"HOME": "/home/me"},
+        )
+        self.assertEqual(
+            cfg.env, (("GTK_IM_MODULE", "fcitx"), ("XMODIFIERS", "@im=fcitx"))
+        )
+        self.assertEqual(cfg.command, ("kitty",))
+
+    def test_a_value_may_contain_equals_signs(self) -> None:
+        self.assertEqual(env_pair("A=b=c"), ("A", "b=c"))
+        self.assertEqual(env_pair("A="), ("A", ""))
+        cfg = parse_args(["--env", "OPTS=a=b=c", "--", "kitty"], environ={"HOME": "/home/me"})
+        self.assertEqual(cfg.env, (("OPTS", "a=b=c"),))
+
+    def test_bad_env_arguments_are_rejected(self) -> None:
+        for value in ("NOEQUALS", "=novalue", "BAD NAME=1", "NUL\0NAME=1"):
+            with self.assertRaises(ClipponError):
+                parse_args(["--env", value, "--", "kitty"], environ={"HOME": "/home/me"})
+        with self.assertRaises(ClipponError):
+            parse_args(["--env"], environ={"HOME": "/home/me"})
+
+    def test_cage_gets_the_requested_variables(self) -> None:
+        env = cage_environment({}, extra={"GTK_IM_MODULE": "fcitx"})
+        self.assertEqual(env["GTK_IM_MODULE"], "fcitx")
+
+    def test_requested_variables_win_over_the_inherited_ones(self) -> None:
+        with mock.patch.dict(os.environ, {"GTK_IM_MODULE": "ibus"}):
+            env = cage_environment({}, extra={"GTK_IM_MODULE": "fcitx"})
+        self.assertEqual(env["GTK_IM_MODULE"], "fcitx")
+
+    def test_the_session_keeps_its_own_display_audio_and_shims(self) -> None:
+        env = cage_environment(
+            {"PULSE_SERVER": "unix:/tmp/pulse"},
+            extra={"WAYLAND_DISPLAY": "wayland-9", "PULSE_SERVER": "unix:/tmp/other"},
+        )
+        self.assertNotIn("WAYLAND_DISPLAY", env)
+        self.assertEqual(env["PULSE_SERVER"], "unix:/tmp/pulse")
+        self.assertTrue(env["LD_PRELOAD"].startswith(str(SHIM_PATH)))
+
+    def test_clipponctl_carries_env_into_the_request(self) -> None:
+        request = parse_ctl(
+            ["start", "alpha", "--env", "GTK_IM_MODULE=fcitx", "--", "kitty"]
+        )
+        self.assertEqual(request["env"], {"GTK_IM_MODULE": "fcitx"})
+
+    def test_the_daemon_merges_env_under_its_own_names(self) -> None:
+        from clippon.daemon import _child_env, _env_map
+
+        asked = _env_map({"GTK_IM_MODULE": "fcitx", "STREAM_TRAY": "enabled"})
+        with mock.patch.dict(os.environ, {"GTK_IM_MODULE": "ibus", "LD_PRELOAD": "/tmp/x.so"}):
+            env = _child_env("cage-sink", "enabled", "auto", asked)
+        self.assertEqual(env["GTK_IM_MODULE"], "fcitx")
+        self.assertEqual(env["STREAM_TRAY"], "auto")
+        self.assertNotIn("LD_PRELOAD", env)
+
+    def test_a_bad_env_payload_is_refused(self) -> None:
+        from clippon.daemon import _env_map
+
+        self.assertEqual(_env_map(None), {})
+        for payload in (["GTK_IM_MODULE=fcitx"], {"": "x"}, {"K": 1}):
+            with self.assertRaises(ClipponError):
+                _env_map(payload)
 
 
 class ArtworkTests(unittest.TestCase):

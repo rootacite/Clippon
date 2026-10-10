@@ -133,8 +133,8 @@ The application list then contains one entry per session, named after the sessio
 
 | Command | What it does |
 | --- | --- |
-| `clippon [--verbose] [--res AxB[@C[Hz]]] [--] <command>` | Run one session in the foreground, on the host network. |
-| `clipponctl start NAME [--verbose] [--res ...] [--] <command>` | Create a session in its own namespace and start it. |
+| `clippon [--verbose] [--res AxB[@C[Hz]]] [--env K=V]... [--] <command>` | Run one session in the foreground, on the host network. |
+| `clipponctl start NAME [--verbose] [--res ...] [--env K=V]... [--] <command>` | Create a session in its own namespace and start it. |
 | `clipponctl list` | Sessions, their addresses, pids and commands. |
 | `clipponctl stop NAME` | Stop a session, its application and its audio stack. |
 | `clipponctl expose NAME` / `hide` | Point the stream ports at a session yourself, without a launch. |
@@ -147,6 +147,19 @@ The application list then contains one entry per session, named after the sessio
 | `STREAM_TRAY=auto\|enabled\|disabled` | Sunshine's tray. `auto` disables it when no StatusNotifier host is present, which is the usual case on a headless machine. |
 | `STREAM_AUDIO=disabled` | Skip the private audio stack; the application then uses the host's default sink. |
 | `STREAM_LOG_DIR=DIR` | Where logs go. Default `$XDG_STATE_HOME/clippon/instances/<name>`, and `$XDG_STATE_HOME/cage-sunshine` without `--instance`. |
+
+`--env KEY=VALUE` sets one more variable for cage and for the program it starts. It can be repeated, and it is how a session gets something the daemon's own environment does not have — input methods are the usual case:
+
+```bash
+clipponctl start alpha \
+  --env GTK_IM_MODULE=fcitx \
+  --env QT_IM_MODULE=fcitx \
+  --env XMODIFIERS=@im=fcitx \
+  --env SDL_IM_MODULE=fcitx \
+  -- kitty
+```
+
+A name given this way beats the same name in the daemon's environment. The session's own settings are not up for grabs: the sink, the audio mode and the tray come from the start request, and the display, the private audio socket and the shims are set by the session itself.
 
 ## Files and state
 

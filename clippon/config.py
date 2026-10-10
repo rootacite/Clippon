@@ -33,6 +33,9 @@ Options:
   --res AxB[@C[Hz]]   output mode to set inside cage before the app starts,
                       e.g. --res 1920x1080 or --res 2560x1440@120Hz. Overrides
                       STREAM_RES; --res '' keeps wlroots' default of 1280x720.
+  --env KEY=VALUE     extra environment variable for cage and the app it runs,
+                      e.g. --env GTK_IM_MODULE=fcitx. Repeatable, and it
+                      overrides the same name in the surrounding environment.
   --instance NAME     per-instance config and logs, used by clippond. The
                       process must already be inside that instance's network
                       namespace. NAME matches [a-z][a-z0-9-]{0,11}.
@@ -86,6 +89,7 @@ class Config:
     runtime_dir: Path
     log_dir: Path
     instance: str = ""
+    env: tuple[tuple[str, str], ...] = ()
     shim: Path = SHIM_PATH
     addr_shim: Path = ADDR_SHIM_PATH
     cursor_shim: Path = CURSOR_SHIM_PATH
@@ -101,6 +105,20 @@ def resolution_ok(value: str) -> bool:
     return _RES_RE.fullmatch(value) is not None
 
 
+def env_pair(value: str) -> tuple[str, str]:
+    """Split one `--env` argument into a name and a value.
+
+    Everything after the first `=` is the value, so a value may contain more of
+    them: `--env OPTS=a=b` sets OPTS to `a=b`.
+    """
+    key, sep, text = value.partition("=")
+    if not sep or not key:
+        raise ClipponError(f"--env: expected KEY=VALUE (got {value!r})")
+    if "\0" in value or any(char.isspace() for char in key):
+        raise ClipponError(f"--env: {key!r} is not a variable name")
+    return key, text
+
+
 def parse_args(argv: list[str], environ: Mapping[str, str] | None = None) -> Config:
     """Parse options the way the shell script did: they stop at the command."""
     env = os.environ if environ is None else environ
@@ -109,6 +127,7 @@ def parse_args(argv: list[str], environ: Mapping[str, str] | None = None) -> Con
     res_set = False
     verbose = False
     instance = ""
+    extra: list[tuple[str, str]] = []
 
     while args:
         item = args[0]
@@ -117,6 +136,16 @@ def parse_args(argv: list[str], environ: Mapping[str, str] | None = None) -> Con
             raise SystemExit(0)
         if item == "--verbose":
             verbose = True
+            del args[0]
+            continue
+        if item == "--env":
+            if len(args) < 2:
+                raise ClipponError("--env needs KEY=VALUE")
+            extra.append(env_pair(args[1]))
+            del args[:2]
+            continue
+        if item.startswith("--env="):
+            extra.append(env_pair(item[len("--env=") :]))
             del args[0]
             continue
         if item == "--instance":
@@ -187,4 +216,5 @@ def parse_args(argv: list[str], environ: Mapping[str, str] | None = None) -> Con
         runtime_dir=Path(runtime),
         log_dir=log_dir,
         instance=instance,
+        env=tuple(extra),
     )

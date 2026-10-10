@@ -17,7 +17,7 @@ HELP = """\
 Usage: clipponctl <command>
 
   list
-  start NAME [--verbose] [--res AxB[@C[Hz]]] [--] <command> [args...]
+  start NAME [--verbose] [--res AxB[@C[Hz]]] [--env K=V]... [--] <command> [args...]
   stop NAME
   expose NAME
   hide
@@ -27,7 +27,9 @@ start runs that command inside its own network namespace. expose points the
 stream ports at one instance. hide removes that mapping. pin submits the
 4-digit PIN Moonlight is showing.
 Options for start follow the same rules as clippon and must come before the
-command.
+command. --env KEY=VALUE reaches cage and the program it runs, which is how a
+session gets variables the daemon does not have, e.g.
+  clipponctl start alpha --env GTK_IM_MODULE=fcitx --env XMODIFIERS=@im=fcitx -- kitty
 
 clippond must already be running (systemd --user unit clippond.service).
 """
@@ -65,6 +67,7 @@ def parse_ctl(argv: list[str], environ: Mapping[str, str] | None = None) -> dict
             "audio": cfg.audio,
             "tray": cfg.tray,
             "verbose": cfg.verbose,
+            "env": dict(cfg.env),
         }
     raise ClipponError(
         f"unknown command {op!r}; try clipponctl --help",

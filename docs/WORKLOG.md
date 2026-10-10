@@ -186,13 +186,36 @@ AssetType=0                    200，仍由后端回答（Sunshine 自己的 600
 
 局限：Moonlight 自己会把封面缓存到磁盘（`app/backend/boxartmanager.cpp`，按主机 uuid 与 appId 存 PNG），客户端要清掉那份缓存才会重新请求；截图是请求那一刻的画面，应用停掉之后卡片保持最后一次的结果。
 
+### 十三、`--env` 把变量交给会话
+
+`clippond` 是用户服务，它继承的是登录会话的环境，跟用户当前这个终端无关，所以输入法这类变量得单独指定：`GTK_IM_MODULE=fcitx clipponctl start ...` 只会改 clipponctl 自己的环境。
+
+现在 `clippon` 与 `clipponctl start` 都接受可重复的 `--env KEY=VALUE`（也认 `--env=KEY=VALUE`，值里可以再出现 `=`）：
+
+- `clippon/config.py` 解析成 `Config.env`，`env_pair()` 拒绝没有 `=`、名字为空、名字含空白或含 NUL 的写法。
+- 前台路径由 `cage_environment()` 的新参数 `extra` 落进 cage 的环境，`session.py` 把 `cfg.env` 传下去。
+- daemon 路径不走命令行（值会被 `ps` 看到），而是 `clipponctl` 把变量放进请求，`clippond` 用 `_child_env()` 并进会话进程的环境，再被 `cage_environment()` 的 `os.environ.copy()` 继承。
+- 覆盖顺序两边一致：`--env` 覆盖继承来的同名变量；sink、音频模式与 tray 由请求字段决定，显示、私有音频 socket、`LD_PRELOAD` 与 `CLIPPON_SEAT` 由会话自己决定。daemon 的 `_child_env()` 仍会丢掉传进来的 `LD_PRELOAD`，避免有人往会话里预载东西。
+
+验证（2026-10-10 22:53，daemon 重启后）：
+
+```text
+clipponctl start envprobe --env GTK_IM_MODULE=fcitx --env XMODIFIERS=@im=fcitx --env SDL_IM_MODULE=fcitx -- sh -c 'env > /tmp/...'
+  应用与 cage 的环境里都出现这三个变量；SDL_IM_MODULE 在 clippond 自己的环境里并不存在，只能来自 --env
+  同一实例再带 --env GTK_IM_MODULE=xyz --env STREAM_SINK=hacked：应用看到 GTK_IM_MODULE=xyz，STREAM_SINK 仍是 cage-sink
+clippon --env PROBE=frontend -- sh -c 'env > /tmp/...'
+  前台路径同样把 PROBE=frontend 交给了 cage 启动的应用
+```
+
+第一次探测之所以“看起来生效”，是因为当时 `clippond` 还是 22:22 启动的旧进程，而那些变量本来就在它的环境里；重启服务之后才验出了真正的差异。
+
 ## 当前状态
 
 - `clippon-net` 与 `clippond` 都在运行。
 - `alpha`（10.200.0.2）与 `beta`（10.200.0.3）各自在自己的 netns 里，端口互不冲突。
 - 网关在另一台机器的 Moonlight 上表现为一台主机，应用列表里是 `alpha` 和 `beta`，两个都能打开，指针和键盘正常。
 - 封面是这个实例的实时截图（见十二）；客户端把封面缓存到磁盘，旧客户端要清一次缓存。
-- 单元测试 57 项通过。
+- 单元测试 66 项通过。
 
 ## 目录
 

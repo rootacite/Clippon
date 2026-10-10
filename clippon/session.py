@@ -128,6 +128,7 @@ class Session:
                 self.cfg.shim,
                 self.cfg.cursor_shim,
                 seat=instance_seat(self.cfg.instance, self.cfg.vhid_shim),
+                extra=dict(self.cfg.env),
             )
         except OSError as exc:
             raise ClipponError(f"cannot start cage: {exc}") from exc

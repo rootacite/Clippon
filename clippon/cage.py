@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 
 from clippon.config import CURSOR_SHIM_PATH, SHIM_PATH
@@ -46,6 +47,7 @@ def cage_environment(
     shim: Path = SHIM_PATH,
     cursor_shim: Path = CURSOR_SHIM_PATH,
     seat: str = "",
+    extra: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Environment for cage itself. The client wrapper drops LD_PRELOAD again.
 
@@ -53,8 +55,14 @@ def cage_environment(
     stands in for the WL_OUTPUT property wlroots 0.20 does not read. *seat* is
     the name the override reports, so this instance reads only the devices
     udev tagged for it.
+
+    *extra* is what `--env` asked for. It beats the value inherited from the
+    environment, and the entries set below still beat it in turn: the display,
+    the audio socket and the shims stay this function's to decide.
     """
     env = os.environ.copy()
+    if extra:
+        env.update(extra)
     env.pop("WAYLAND_DISPLAY", None)
     env.pop("DISPLAY", None)
     env.update(audio_env)
@@ -84,10 +92,11 @@ def start_cage(
     shim: Path = SHIM_PATH,
     cursor_shim: Path = CURSOR_SHIM_PATH,
     seat: str = "",
+    extra: Mapping[str, str] | None = None,
 ) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         ["cage", "--", *client_argv(command, resolution)],
-        env=cage_environment(audio_env, shim, cursor_shim, seat),
+        env=cage_environment(audio_env, shim, cursor_shim, seat, extra),
         stdout=log_file,  # type: ignore[arg-type]
         stderr=subprocess.STDOUT,
     )
