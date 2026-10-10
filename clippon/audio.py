@@ -179,7 +179,7 @@ class AudioInstance:
         base = os.environ.copy()
         self.procs.append(
             _popen(
-                ["pipewire"],
+                _own_session(["pipewire"]),
                 base
                 | {
                     "PIPEWIRE_RUNTIME_DIR": str(self.root),
@@ -190,7 +190,7 @@ class AudioInstance:
         )
         self.procs.append(
             _popen(
-                ["pipewire-pulse"],
+                _own_session(["pipewire-pulse"]),
                 base
                 | {
                     "PIPEWIRE_RUNTIME_DIR": str(self.root),
@@ -202,7 +202,7 @@ class AudioInstance:
         if shutil.which("wireplumber") and shutil.which("dbus-run-session"):
             self.procs.append(
                 _popen(
-                    ["dbus-run-session", "--", "wireplumber"],
+                    _own_session(["wireplumber"]),
                     base
                     | {
                         "PIPEWIRE_RUNTIME_DIR": str(self.root),
@@ -225,6 +225,19 @@ class AudioInstance:
                 return False
             time.sleep(0.1)
         return self.pulse_socket.is_socket()
+
+
+def _own_session(argv: list[str]) -> list[str]:
+    """Run a daemon on a session bus of its own.
+
+    pipewire-pulse registers org.pulseaudio.Server on the bus it inherits, and
+    the desktop session already owns that name, so every instance that shares
+    the host bus fails to register. wireplumber has always been started this
+    way; the other daemons now are too.
+    """
+    if shutil.which("dbus-run-session"):
+        return ["dbus-run-session", "--", *argv]
+    return argv
 
 
 def _symlink(target: Path, link: Path) -> None:

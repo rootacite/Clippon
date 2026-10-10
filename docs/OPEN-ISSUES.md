@@ -112,18 +112,6 @@ beta   http://10.200.0.3:47989/serverinfo   currentgame=0          state=SUNSHIN
 - 网关侧，加固：`/launch` 命中某个后端时，如果该后端 `currentgame > 0`，先向它发一次 `/cancel` 再转发，让重复启动变成幂等。这条不需要新的存活探测。
 - 更彻底的：用 nft 计数器之类的内核侧信号判断流是否真的活着，不活跃就自动收掉后端。需要 helper 增加计数器操作。
 
-## 音频
-
-### 每个实例的 pipewire-pulse 在真实会话总线上抢注 D-Bus 名字
-
-启动第二个实例时会看到：
-
-```text
-mod.protocol-pulse | D-Bus name org.pulseaudio.Server already taken.
-```
-
-`pipewire` 和 `pipewire-pulse` 继承了 host 的会话总线，只有第一个实例能注册成功；`wireplumber` 已经单独套了一层 `dbus-run-session`，这两个没有。目前 socket 仍然可用（`pactl info` 能连上，Sunshine 也正常用它），所以没动。要干净的话，把这两个也套上 `dbus-run-session`，和 `wireplumber` 保持一致。
-
 ## 工具
 
 ### 直接跑 `clippon --instance` 需要 clippond 先写过文件

@@ -43,6 +43,29 @@ Clippon：在一台机器上并行运行多个 Sunshine 实例，让 Moonlight �
 - **cage 不能待在 netns 里。** udev 的设备热插拔事件走 `NETLINK_KOBJECT_UEVENT`，这个组播组只存在于 `init_net`，netns 里的合成器启动时能枚举到已有设备，但之后新建的设备永远收不到。而 Sunshine 恰恰在 cage 起来之后才建虚拟输入设备。现在 clippon、cage、私有 PipeWire 都在 host，只有 Sunshine 进 netns；`/dev/input` 和 uinput 是内核全局对象，所以 netns 里建的设备 host 上的 cage 收得到。
 - **虚拟鼠标没有输出映射。** cage 只在 `wlr_pointer.output_name` 有值时才映射输入设备，而 wlroots 0.20.2 不从 udev 的 `WL_OUTPUT` 属性填这个字段。`assets/wlr_cursor_map.c` 用 `LD_PRELOAD` 拦截 `wlr_cursor_attach_input_device`，把设备映射到输出布局的中心输出。
 
+### 五、真实客户端配对走通
+
+另一台设备上的 Moonlight 删除主机后重新配对，网关日志里五个阶段都在 20:35:59–20:36:15 完成（`getservercert`、`clientchallenge`、`serverchallengeresp`、`clientpairingsecret`、`pairchallenge`），最后一行 `pairing result paired=1`。
+
+`clients.json` 的内容没有变化（mtime 19:35:35、sha256 `f6aa8440…`），说明客户端出示的证书原本就在已知列表里：`on_paired` 在结果日志之前调用（`clippon/pair.py:156`），`add()` 只在 PEM 是新的才落盘（`clippon/clients.py:33`），所以从旧 Sunshine 导入的那 9 张里就有这一张。列表里第 10 张是 `CN=testsim`，来自配对单元测试的伪造客户端。
+
+重启 `clippond` 之后，客户端仍然显示已配对、不再要求 PIN，`alpha` 与 `beta` 都在列表里且能正常进入，指针正常。
+
+### 六、每个实例独立的 D-Bus 会话总线
+
+`pipewire` 与 `pipewire-pulse` 之前继承宿主的会话总线，而宿主桌面的 pipewire-pulse（PID 18009）本身就占着 `org.pulseaudio.Server`，于是每个实例的 pipewire-pulse 注册都失败，日志里留下 `D-Bus name org.pulseaudio.Server already taken.`。原先记成"第一个实例能注册成功、第二个才冲突"，实测第一个实例也一样，名字是宿主占的。
+
+`clippon/audio.py` 新增 `_own_session()`，三个守护进程都套进 `dbus-run-session`（`wireplumber` 原先就是这么起的；缺 `dbus-run-session` 时退回原样启动）。
+
+重启 `beta` 后的验证：
+
+- 实例音频日志里 `already taken` 出现 0 次。
+- `busctl --address=<beta 私有总线> call … GetNameOwner org.pulseaudio.Server` 返回 `:1.0`，即 beta 自己的 pipewire-pulse（pid 611529）。
+- `pactl` 连 beta 的 socket 能看到 `cage-sink` 与 `cage-sink.monitor`（Sunshine 抓取用的就是 monitor），播放测试时 sink 转为活动状态。
+- 宿主音频未受影响：pulse PID 仍是 18009，默认 sink 仍是那块声卡。
+
+`alpha` 没有重启，进程仍走旧路径，下次重启时生效。单元测试 35 项通过。
+
 ## 当前状态
 
 - `clippon-net` 与 `clippond` 都在运行。
