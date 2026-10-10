@@ -19,6 +19,7 @@ from clippon.daemon import clippon_argv
 from clippon.gateway import (
     classify,
     external_app_id,
+    may_use_host,
     merge_applists,
     replace_query_appid,
     rewrite_session_host,
@@ -172,6 +173,34 @@ class TrayTests(unittest.TestCase):
         self.assertIn(os.getpid(), all_pids())
 
 
+class ClientGatingTests(unittest.TestCase):
+    """Only the pairing paths answer before a client certificate is known."""
+
+    def test_pairing_paths_work_unpaired(self) -> None:
+        for path in ("/serverinfo", "/pair"):
+            self.assertTrue(may_use_host(path, paired=False), path)
+
+    def test_everything_else_needs_a_known_client(self) -> None:
+        for path in ("/applist", "/appasset", "/launch", "/resume", "/cancel", "/nope"):
+            self.assertFalse(may_use_host(path, paired=False), path)
+            self.assertTrue(may_use_host(path, paired=True), path)
+
+    def test_both_fingerprint_readers_agree(self) -> None:
+        from OpenSSL import crypto
+
+        from clippon.clients import fingerprint, openssl_fingerprint
+        from clippon.identity import ensure
+
+        with tempfile.TemporaryDirectory() as directory:
+            identity = ensure(Path(directory))
+            pem = identity.client_cert.read_text(encoding="utf-8")
+            stored = fingerprint(pem).hex()
+            read_back = openssl_fingerprint(
+                crypto.load_certificate(crypto.FILETYPE_PEM, pem.encode())
+            )
+        self.assertEqual(stored, read_back)
+
+
 class ReclaimTests(unittest.TestCase):
     def test_orphan_namespaces_are_the_ones_we_would_have_made(self) -> None:
         existing = [
@@ -323,6 +352,22 @@ class PortTableTests(unittest.TestCase):
         self.assertNotIn("dnat to", nft_table(None))
         self.assertEqual(allocate_host(set()), 2)
         self.assertEqual(allocate_host({2, 3}), 4)
+
+    def test_local_clients_get_the_same_dnat_on_the_output_hook(self) -> None:
+        def output_chain(text: str) -> str:
+            # The address set contains "}", so cut on the chain's own terminator.
+            return text.split("chain output {")[1].split("\n  }")[0]
+
+        text = nft_table("10.200.0.2", ["192.168.4.4", "10.0.0.7"])
+        output = output_chain(text)
+        self.assertIn("ip daddr { 10.0.0.7, 192.168.4.4 } tcp dport", output)
+        self.assertIn("dnat to 10.200.0.2", output)
+        for port in (47998, 47999, 48000, 48010):
+            self.assertIn(str(port), output)
+        # Without a LAN address there is nothing to match on locally, and a
+        # bare "tcp dport 48010" would hijack traffic to other hosts.
+        self.assertNotIn("dnat", output_chain(nft_table("10.200.0.2")))
+        self.assertNotIn("dnat", output_chain(nft_table(None, ["192.168.4.4"])))
 
     def test_lan_addresses_skip_the_bridge_and_docker(self) -> None:
         payload = [

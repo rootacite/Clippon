@@ -15,6 +15,15 @@ _APPID = re.compile(r"([?&]appid=)[^&]*")
 
 LOCAL_PATHS = frozenset({"/serverinfo"})
 FORWARD_PATHS = frozenset({"/pair", "/applist", "/appasset", "/launch", "/resume", "/cancel"})
+# Served before the host is paired: /serverinfo is how a client learns it has to
+# pair, and /pair is how it does. Everything else needs a client certificate
+# this host has recorded.
+PAIRING_PATHS = frozenset({"/serverinfo", "/pair"})
+
+
+def may_use_host(path: str, paired: bool) -> bool:
+    """Whether *path* may reach a backend, start a session or list apps."""
+    return paired or path in PAIRING_PATHS
 APP_VERSION = "7.1.431.-1"
 GFE_VERSION = "3.23.0.74"
 

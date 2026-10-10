@@ -11,7 +11,6 @@ Nothing here is distro-agnostic on purpose. Other systems are rejected up front.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import pwd
@@ -128,23 +127,27 @@ def ensure_tools(dry_run: bool) -> None:
         missing.append("gcc")
     if not _has_cryptography():
         missing.append("python-cryptography")
+    if not _has_module("OpenSSL"):
+        missing.append("python-pyopenssl")
     for binary in ("ip", "nsenter", "setpriv", "sysctl", "openssl"):
         if shutil.which(binary) is None:
             raise InstallError(f"{binary} is not on PATH")
     if not missing:
-        note("inst", "nft, iptables, gcc and cryptography already present")
+        note("inst", "nft, iptables, gcc, cryptography and pyOpenSSL already present")
         return
     note("inst", "pacman will install %s", ", ".join(missing))
     run(as_root(["pacman", "-S", "--needed", "--noconfirm", *missing]), dry_run=dry_run)
 
 
 def _has_cryptography() -> bool:
-    if importlib.util.find_spec("cryptography") is not None:
-        return True
-    # The service runs this interpreter; check it rather than only ours.
+    return _has_module("cryptography")
+
+
+def _has_module(name: str) -> bool:
+    """Whether the interpreter that will run the services can import *name*."""
     return (
         subprocess.run(
-            [sys.executable, "-c", "import cryptography"],
+            [sys.executable, "-c", f"import {name}"],
             check=False,
             capture_output=True,
         ).returncode

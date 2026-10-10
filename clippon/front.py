@@ -10,18 +10,24 @@ sessionUrl0. 47990 is a raw TCP proxy onto the exposed instance's web UI.
 from __future__ import annotations
 
 import http.client
+import io
+import select
 import socket
 import ssl
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import uuid as uuidlib
 
-from clippon.clients import PairedClients
+from OpenSSL import SSL as openssl
+
+from clippon.clients import PairedClients, openssl_fingerprint
 from clippon.config import ClipponError
 from clippon.gateway import (
     classify,
     external_app_id,
+    may_use_host,
     merge_applists,
     replace_query_appid,
     request_path,
@@ -37,6 +43,7 @@ from clippon.ports import GAMESTREAM_HTTP, GAMESTREAM_HTTPS, WEB_UI
 from clippon.protocol import HELPER_SOCK, recv_obj, send_obj
 
 _HOSTNAME = "clippon"
+HANDSHAKE_TIMEOUT = 10.0
 
 
 class Front:
@@ -61,15 +68,17 @@ class Front:
 
     def handle(self, handler: BaseHTTPRequestHandler, https: bool) -> None:
         target = handler.path
+        path = request_path(target)
         kind = classify(target)
         local_ip = handler.connection.getsockname()[0]
-        peer = _peer_fingerprint(handler.connection) if https else None
-        # Moonlight decides "paired" purely from ServerInfo.PairStatus, and it
-        # only accepts HTTPS answers once it holds a pinned certificate. The
-        # certificate itself is not visible to us under CERT_NONE, so report
-        # from our own record of completed pairings.
-        paired = https and bool(self.clients.all())
-        if request_path(target) == "/pair":
+        peer = _peer_fingerprint(handler.connection)
+        # Moonlight decides "paired" from ServerInfo.PairStatus, and it is the
+        # client certificate that tells us whose answer to give. A request
+        # without a certificate (the plain HTTP port, an unknown client) is not
+        # paired, and only the pairing paths are served for it: the rest of the
+        # GameStream surface belongs to clients this host has recorded.
+        paired = peer is not None and self.clients.knows(peer)
+        if path == "/pair":
             try:
                 body = self.pairing.handle(target).encode()
             except (ValueError, OSError) as exc:
@@ -80,6 +89,15 @@ class Front:
         if kind == "local":
             body = self._serverinfo(local_ip, paired).encode()
             _write(handler, 200, body)
+            return
+        if not may_use_host(path, paired):
+            note(
+                "gate",
+                "refused %s from %s: no paired client certificate",
+                target,
+                handler.client_address[0],
+            )
+            _write(handler, 403, _status_page(403, "pair with this host first").encode())
             return
         if kind != "forward":
             _write(handler, 404, _status_page(404, "Not found").encode())
@@ -230,22 +248,12 @@ class Front:
 
     def _serve_http(self, port: int, https: bool) -> None:
         try:
-            server = ThreadingHTTPServer(("0.0.0.0", port), _Handler)
+            server = _server_for(port, https, self.identity)
         except OSError as exc:
             error("gate", "cannot bind %s: %s", port, exc)
             return
         server.front = self  # type: ignore[attr-defined]
         server.https = https  # type: ignore[attr-defined]
-        if https:
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            context.load_cert_chain(self.identity.server_cert, self.identity.server_key)
-            # Do not ask for a client certificate. Moonlight's certificate is
-            # self-signed, and CPython's ssl module has no verify callback, so
-            # CERT_OPTIONAL fails the handshake with "unknown ca" before we can
-            # reach the pairing check. Pairing state is therefore reported from
-            # our own record; see docs/OPEN-ISSUES.md.
-            context.verify_mode = ssl.CERT_NONE
-            server.socket = context.wrap_socket(server.socket, server_side=True)
         threading.Thread(
             target=server.serve_forever,
             name=f"clippon-{port}",
@@ -304,19 +312,170 @@ def _write(handler: BaseHTTPRequestHandler, status: int, body: bytes) -> None:
 
 
 def _peer_fingerprint(connection: object) -> str | None:
-    """SHA-256 of the client certificate, in the form PairedClients stores."""
-    getpeercert = getattr(connection, "getpeercert", None)
-    if getpeercert is None:
-        return None
-    try:
-        der = getpeercert(binary_form=True)
-    except (ValueError, OSError):
-        return None
-    if not der:
-        return None
-    import hashlib
+    """SHA-256 of the client certificate, in the form PairedClients stores.
 
-    return hashlib.sha256(der).hexdigest()
+    The TLS layer attaches it to the connection it accepted; a request that
+    presented no certificate (the plain HTTP port, an unknown client) has none.
+    """
+    return getattr(connection, "peer_fingerprint", None)
+
+
+def _server_for(port: int, https: bool, identity: Identity) -> ThreadingHTTPServer:
+    if https:
+        return _TlsServer(("0.0.0.0", port), _Handler, identity)
+    return ThreadingHTTPServer(("0.0.0.0", port), _Handler)
+
+
+def _tls_context(identity: Identity) -> openssl.Context:
+    """TLS for 47984 that keeps the client certificate readable.
+
+    CPython's ssl module cannot verify a self-signed client certificate, and it
+    exposes no verify callback, so the handshake here asks for a certificate and
+    accepts whatever arrives. front.handle() then compares its fingerprint
+    against the recorded clients, per request, which is what lets pairing accept
+    an unknown certificate while the rest of the surface does not.
+    """
+    context = openssl.Context(openssl.TLS_SERVER_METHOD)
+    context.use_certificate_file(str(identity.server_cert))
+    context.use_privatekey_file(str(identity.server_key))
+    context.set_verify(openssl.VERIFY_PEER, lambda *_args: True)
+    return context
+
+
+class _TlsConnection:
+    """What http.server needs from a connection, over a pyOpenSSL one.
+
+    OpenSSL.SSL.Connection has no makefile and no socket shortcuts such as
+    getpeername, so this carries both it and the socket underneath.
+    """
+
+    def __init__(
+        self,
+        connection: openssl.Connection,
+        raw: socket.socket,
+        peer_fingerprint: str | None,
+    ) -> None:
+        self._connection = connection
+        self._raw = raw
+        self.peer_fingerprint = peer_fingerprint
+
+    def makefile(self, mode: str = "rb", buffering: int = -1) -> object:
+        if "b" not in mode:
+            raise ValueError(f"{mode!r} is not a binary mode")
+        stream = _TlsStream(self._connection)
+        if buffering == 0:
+            return stream
+        if "r" in mode:
+            return io.BufferedReader(stream)
+        return io.BufferedWriter(stream)
+
+    def recv(self, size: int) -> bytes:
+        return self._connection.recv(size)
+
+    def sendall(self, data: bytes) -> None:
+        self._connection.sendall(data)
+
+    def getsockname(self) -> tuple[str, int]:
+        return self._raw.getsockname()
+
+    def getpeername(self) -> tuple[str, int]:
+        return self._raw.getpeername()
+
+    def settimeout(self, value: float | None) -> None:
+        self._raw.settimeout(value)
+
+    def shutdown(self, _how: int = socket.SHUT_RDWR) -> None:
+        try:
+            self._connection.shutdown()
+        except (openssl.Error, OSError):
+            pass
+
+    def close(self) -> None:
+        for closer in (self._connection.close, self._raw.close):
+            try:
+                closer()
+            except (openssl.Error, OSError):
+                pass
+
+
+class _TlsStream(io.RawIOBase):
+    """A binary stream over an OpenSSL connection, for BufferedReader."""
+
+    def __init__(self, connection: openssl.Connection) -> None:
+        self._connection = connection
+
+    def readable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: object) -> int:
+        view = memoryview(buffer)  # type: ignore[arg-type]
+        try:
+            data = self._connection.recv(len(view))
+        except openssl.ZeroReturnError:
+            return 0
+        except openssl.WantReadError:
+            return 0
+        if not data:
+            return 0
+        view[: len(data)] = data
+        return len(data)
+
+    def write(self, data: object) -> int:
+        payload = bytes(data)  # type: ignore[arg-type]
+        self._connection.sendall(payload)
+        return len(payload)
+
+
+class _TlsServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer whose connections are TLS from the start."""
+
+    def __init__(self, address: tuple[str, int], handler: type, identity: Identity) -> None:
+        self._context = _tls_context(identity)
+        super().__init__(address, handler)
+
+    def get_request(self) -> tuple[object, tuple[str, int]]:
+        while True:
+            raw, address = super().get_request()
+            connection = self._handshake(raw, address)
+            if connection is not None:
+                return connection, address
+
+    def _handshake(
+        self, raw: socket.socket, address: tuple[str, int]
+    ) -> _TlsConnection | None:
+        """Finish the handshake within a deadline, or close and give up.
+
+        A timeout on the socket puts it in non-blocking mode, so the handshake
+        reports WantReadError instead of waiting; select() provides the wait.
+        """
+        deadline = time.monotonic() + HANDSHAKE_TIMEOUT
+        connection = openssl.Connection(self._context, raw)
+        connection.set_accept_state()
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("handshake deadline")
+                raw.settimeout(remaining)
+                try:
+                    connection.do_handshake()
+                    break
+                except openssl.WantReadError:
+                    if not select.select([raw], [], [], remaining)[0]:
+                        raise TimeoutError("handshake deadline") from None
+        except (openssl.Error, OSError, TimeoutError) as exc:
+            note("gate", "tls handshake with %s failed: %r", address[0], exc)
+            raw.close()
+            return None
+        raw.settimeout(None)
+        return _TlsConnection(
+            connection,
+            raw,
+            openssl_fingerprint(connection.get_peer_certificate()),
+        )
 
 
 def _status_page(code: int, message: str) -> str:

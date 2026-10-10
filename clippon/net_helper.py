@@ -595,7 +595,7 @@ class Helper:
         subprocess.run(["ip", "netns", "del", ns], check=False, capture_output=True)
 
     def _apply_nft(self, ip: str | None) -> None:
-        text = nft_table(ip)
+        text = nft_table(ip, self._lan())
         subprocess.run(
             ["nft", "delete", "table", "ip", "clippon"],
             check=False,

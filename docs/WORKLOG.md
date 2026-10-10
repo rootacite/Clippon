@@ -119,6 +119,40 @@ alpha 残留: 座位进程 0 个，音频标记进程 0 个
 
 历史残留也在同一次对账里清掉：日志 `removing 6 leftover process(es) of alpha` → `stopped 6 leftover process(es) of alpha`，之后 `beta` 完全未受影响。
 
+### 九、本机客户端也能串流
+
+`nftables` 的 DNAT 只在 `prerouting`，而本机产生的流量走 `output` 钩子，所以在这台机器上直接连 `192.168.4.4` 的流端口不会被转发进实例：应用列表正常、点启动也返回成功，但 RTSP 那一步连不上。
+
+`ports.nft_table()` 现在接收本机的局域网地址，多写一条 `output` 链（`type nat hook output priority dstnat`），规则用 `ip daddr { <本机地址> }` 限定，避免把去往其他主机的 48010 也重定向。地址表在 helper 启动与每次 expose 时刷新。`127.0.0.1` 仍然不行：netns 回不到宿主的 loopback，同机客户端要用局域网地址。
+
+验证：本机连 `192.168.4.4:48010`，netns 里看到入站连接 `10.200.0.2:48010 ← 192.168.4.4:33620`，conntrack 里也能读到被翻译的元组。
+
+### 十、按客户端校验证书
+
+之前 47984 用 `ssl.CERT_NONE`，配对的 `PairStatus` 又是全局的（只要 `clients.json` 里有一条记录，任何客户端都被告知已配对）。后果是：用 Moonlight 添加主机会停在配对（HTTP 的 `serverinfo` 报 `PairStatus=0`，需要 PIN），但用脚本直接打 HTTPS 端点不需要任何凭据，就能拿应用列表、启动、取消，还能把流端口切走。
+
+CPython 的 `ssl` 做不到这件事：自签名客户端证书过不了链校验，`CERT_OPTIONAL` 在握手阶段就以 `unknown_ca` 失败，而这个模块（3.10 / 3.12 / 3.14）没有校验回调。
+
+现在改成用 pyOpenSSL 接 47984：
+
+- `front._tls_context()`：握手时请求客户端证书并一律接受（`set_verify(VERIFY_PEER, 永真回调)`），把判断留给应用层。
+- `front.handle()`：每条请求读对端证书指纹（`_TlsConnection.peer_fingerprint`）。`/serverinfo` 与 `/pair` 任何客户端都能用——前者是客户端得知"需要配对"的入口，后者是配对本身；其余路径要求指纹已在 `clients.json` 里，否则 403。`PairStatus` 随之变成按客户端回答：已配对给 1，未配对给 0。
+- 细节两处：pyOpenSSL 的 `Connection` 没有 `makefile`，也没有 `getpeername` 之类的快捷方法，所以加了 `_TlsConnection` / `_TlsStream` 两个薄适配层给 `http.server` 用；accepted socket 因为设了超时处于非阻塞模式，`do_handshake()` 会抛 `WantReadError`，所以握手改成 `select` + 10 秒截止的循环。
+- 指纹口径：网关用 pyOpenSSL 读客户端证书，`PairedClients` 用 cryptography 存，两边都是对 DER 做 SHA-256；单测把两者钉在一起，从旧 Sunshine 导入的那批 Moonlight 证书不需要重配。
+
+验证（本机探测，网关自己的客户端证书刻意不在 `clients.json` 里，代表局域网里的陌生机器）：
+
+```text
+                                   未配对客户端        已配对客户端
+HTTPS /serverinfo                 200 PairStatus=0   200 PairStatus=1
+HTTPS /applist                    403                200 apps=beta,alpha
+HTTPS /pair (getservercert)       允许（等 PIN，不回复）
+HTTPS 不带证书 /applist            403
+HTTP  /applist                    403
+```
+
+`clients.json` 恢复成原来的 10 条之后，未配对客户端再次被拒。47990 后面仍是 Sunshine 自己的 Web UI，有它自己的登录。
+
 ## 当前状态
 
 - `clippon-net` 与 `clippond` 都在运行。

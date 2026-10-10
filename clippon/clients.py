@@ -8,6 +8,7 @@ from pathlib import Path
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
+from OpenSSL import SSL as openssl
 
 
 class PairedClients:
@@ -64,6 +65,23 @@ def fingerprint(pem: str) -> bytes:
     warns about. The warning is noise here, so it is suppressed.
     """
     return parse_fingerprint(pem) or _strict_fingerprint(pem)
+
+
+def openssl_fingerprint(certificate: object) -> str | None:
+    """The same digest, read from a pyOpenSSL certificate.
+
+    The gateway sees the client certificate through pyOpenSSL while this module
+    stores it through cryptography. Both digests are over the same DER bytes, so
+    they have to agree for a paired client to stay recognized; the test suite
+    pins that.
+    """
+    digest = getattr(certificate, "digest", None)
+    if digest is None:
+        return None
+    try:
+        return bytes(digest("sha256")).decode().replace(":", "").lower()
+    except (openssl.Error, ValueError):
+        return None
 
 
 def parse_fingerprint(pem: str) -> bytes | None:

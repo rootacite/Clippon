@@ -8,6 +8,7 @@ RTSP +21.
 from __future__ import annotations
 
 import ipaddress
+from collections.abc import Sequence
 
 BASE_PORT = 47989
 SUBNET = "10.200.0.0/24"
@@ -46,15 +47,20 @@ def in_subnet(ip: str, subnet: str = SUBNET) -> bool:
     return ipaddress.ip_address(ip) in ipaddress.ip_network(subnet)
 
 
-def nft_table(exposed_ip: str | None) -> str:
+def nft_table(exposed_ip: str | None, lan: Sequence[str] = ()) -> str:
     """DNAT only the stream ports. 47984, 47989 and 47990 belong to the gateway.
 
     The forward chain's policy accept ends this chain only; a later chain can
     still drop the packet. Docker's DOCKER-USER chain is updated separately.
+
+    *lan* holds this host's own addresses. Traffic a client on this host sends
+    to one of them is generated locally, so it passes the output hook and never
+    reaches prerouting; the output chain repeats the same DNAT for it.
     """
     tcp = _port_set(STREAM_TCP_PORTS)
     udp = _port_set(STREAM_UDP_PORTS)
     dnat = ""
+    local = ""
     if exposed_ip is not None:
         if not in_subnet(exposed_ip):
             raise ValueError(f"exposed address {exposed_ip} is outside {SUBNET}")
@@ -62,11 +68,21 @@ def nft_table(exposed_ip: str | None) -> str:
             f"    tcp dport {tcp} dnat to {exposed_ip}\n"
             f"    udp dport {udp} dnat to {exposed_ip}\n"
         )
+        if lan:
+            addresses = ", ".join(sorted(set(lan)))
+            local = (
+                f"    ip daddr {{ {addresses} }} tcp dport {tcp} dnat to {exposed_ip}\n"
+                f"    ip daddr {{ {addresses} }} udp dport {udp} dnat to {exposed_ip}\n"
+            )
     return (
         "table ip clippon {\n"
         "  chain prerouting {\n"
         "    type nat hook prerouting priority dstnat; policy accept;\n"
         f"{dnat}"
+        "  }\n"
+        "  chain output {\n"
+        "    type nat hook output priority dstnat; policy accept;\n"
+        f"{local}"
         "  }\n"
         "  chain postrouting {\n"
         "    type nat hook postrouting priority srcnat; policy accept;\n"

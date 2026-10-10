@@ -75,35 +75,19 @@ WAYLAND_DISPLAY=wayland-0 grim /tmp/after.png
 
 `weston-eventdemo` 适合当被测应用，它的方块会跟着指针事件变色。
 
-## 配对
-
-配对本身已经走通（见 `docs/WORKLOG.md` 第五节）。留在这里的是握手层的那一条限制。
-
-### 网关没法校验 Moonlight 的客户端证书
-
-`47984` 现在用 `ssl.CERT_NONE`，任何能连到这台机器的客户端都能拿到应用列表并启动实例。
-
-试过的路都不通：Moonlight 的客户端证书是自签名的，`ssl.CERT_OPTIONAL` 会在握手阶段以 `unknown_ca` 失败，而 CPython 的 `ssl` 模块（3.10 / 3.12 / 3.14 都确认过）没有 `set_verify` 回调，`VERIFY_X509_PARTIAL_CHAIN` 和把已配对证书 `load_verify_locations(cadata=...)` 也都不接受自签名身份。所以配对状态只能来自网关自己的记录（`clients.json`），握手层管不了。
-
-要真正恢复校验，得换掉 `ssl` 这一层：自己用 OpenSSL 的 `SSL_CTX_set_verify` 接一个永真回调再在应用层比对指纹，或者把 47984 交给一个能这么做的独立进程。
-
-### 配对状态是全局的，认不出具体是哪台设备
-
-`PairStatus` 由 `bool(clients.all())` 决定，只要 `clients.json` 里有一条记录，任何 HTTPS 客户端都会看到 `PairStatus=1`。这是上一条限制的直接后果：既然握手层拿不到对端证书，就没法按客户端区分。当前 `clients.json` 里 10 张证书中 9 张来自宿主机旧 Sunshine，第 10 张是单元测试的 `testsim`。
-
 ## 网络
-
-### 从这台机器自己访问局域网地址不走 DNAT
-
-内核不会把本地产生的流量送进 `prerouting`，所以在本机连 `192.168.4.4:48010` 或三路 UDP 不会命中 `ip clippon`。从别的机器访问是正常的。如果以后想在同一台机器上跑 Moonlight 客户端，需要补 OUTPUT 链的规则并处理回流。
 
 ### 没有实测过 Docker 在跑时的转发
 
 `clippon-net` 会在 `DOCKER-USER` 存在时插入放行 `10.200.0.0/24` 的规则。Docker 现在是 `inactive`，这段没跑过。
 
+已记录，暂不处理（2026-10-10 决定）。影响：Docker 会把 `FORWARD` 策略设成 DROP 并接管 `DOCKER-USER`，我们的流端口属于转发流量，放行规则没落对位置时症状是「应用列表正常、点启动也成功，但串流连不上」。另外 Docker 每次重启会重建自己的链，可能冲掉插入的规则，正在串流时会话会当场断掉。不用 Docker 就没有影响。
+
 ### 实例进程留在 `clippon-net` 的 cgroup 里
 
-`clippon-net.service` 用 `KillMode=process`，重启服务不会杀掉实例。代价是 systemd 记为 `Found left-over process ... in control group`，这些进程的资源限制和日志归属挂在 helper 的 unit 上。要更干净的话得给它们一个独立的 scope。
+`clippon-net.service` 用 `KillMode=process`，重启服务不会杀掉实例。代价是 systemd 记为 `Found left-over process ... in control group`，这些进程的资源限制和日志归属挂在 helper 的 unit 上。
+
+已记录，暂不处理（2026-10-10 决定）。影响：unit 上没有设任何 `CPUQuota`/`MemoryMax`/`TasksMax`，所以现在没有实际后果；一旦给 unit 加限制，限制会作用在所有实例的总和上。要彻底干净得让每个实例跑在自己的 transient scope 里，helper 的 spawn 与 pid 跟踪都要改成从 systemd 取 `MainPID`。
 
 ### 重启 clippond 会弹 KDE 钱包解锁框
 

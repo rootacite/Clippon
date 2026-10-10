@@ -41,6 +41,8 @@ OFFICIAL_PACKAGES = (
     "gcc",
     "procps-ng",
     "python",
+    "python-cryptography",
+    "python-pyopenssl",
     "git",
     "base-devel",
 )
