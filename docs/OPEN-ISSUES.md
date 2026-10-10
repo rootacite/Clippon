@@ -23,6 +23,34 @@ udev 的设备热插拔事件由内核往 netlink 的 `NETLINK_KOBJECT_UEVENT` �
 
 uinput 设备和 `/dev/input` 都是内核全局对象，不是 per-netns 的，所以 Sunshine 在 netns 里建出来的设备，host 上的 cage 照常收得到。helper 为此分成了两个操作：`spawn`（host，给 clippon）和 `spawn-netns`（进 netns，给 sunshine）。
 
+### keyd 抓走虚拟键盘，按键进不了应用
+
+`/etc/keyd/default.conf` 的 `[ids]` 写的是 `*`，keyd 会匹配所有设备。它自己的日志把两类设备分得很清楚：
+
+```text
+DEVICE: match    1209:0002:dc9f44e3  /etc/keyd/default.conf   (libvirtualhid Keyboard)
+DEVICE: ignoring 1209:0003:9faf35e3                           (libvirtualhid Mouse)
+DEVICE: ignoring 1209:0003:684dc0b3                           (libvirtualhid Mouse (Absolute))
+```
+
+虚拟键盘是 `1209:0002`，keyd 匹配后对它 `EVIOCGRAB`，于是合成器的 libinput 再也收不到按键；keyd 把这些键转发到自己那个虚拟键盘上，而那个设备在 seat0，所以按键落在真实桌面上，应用一个都收不到。虚拟鼠标是 `1209:0003`，keyd 忽略，这就是鼠标一直正常、键盘"漏到桌面"的原因。
+
+证据（2026-10-10）：
+
+- keyd 在跑时，对两个虚拟键盘调 `EVIOCGRAB` 返回 `EBUSY`，对虚拟鼠标返回成功；停掉 keyd 后键盘的 `EVIOCGRAB` 成功。
+- 往 `/dev/input/eventN` 写事件只在设备无人抓取时才进入输入核心。同一段代码写虚拟鼠标，另一个 reader 读到了 `REL_X 30`/`REL_Y 20`；写虚拟键盘，reader 什么都读不到。
+- 停掉 keyd 后往虚拟键盘注入 `KEY_SPACE`，alpha 的 mpv 通过 `--input-ipc-server` 报告 `pause` 由 `False` 变 `True`。
+
+处理方向是在 `[ids]` 里排除虚拟键盘，让 keyd 继续管真实键盘：
+
+```ini
+[ids]
+*
+-1209:0002
+```
+
+现状：为做上面的验证停了一次 `keyd.service`，而它的 unit 文件与二进制都已经不在磁盘上（`/usr/lib/systemd/system/keyd.service` 缺失、`multi-user.target.wants/keyd.service` 是悬空符号链接、`pacman -Qs keyd` 为空），进程此前是靠内存里加载的单元跑了 2 天 4 小时，所以 `systemctl start keyd` 现在报 `Unit keyd.service not found`。要恢复得重装 keyd 包。副作用是 `rightalt = rightmeta` 这条改键暂时失效，同时键盘进应用这条路径现在是通的。
+
 ### 两个 cage 会同时打开同一组虚拟设备
 
 udev 规则只能按设备名（`libvirtualhid*`）打 `ID_SEAT`，区分不出设备属于哪个实例。所以两个实例都在跑时，两边的 cage 会各自打开全部设备。同一时刻只有一路在推流，实际影响是另一侧的 cage 白拿一份事件。要彻底分开得让每个实例有独立的 seat 名，那需要让 udev 知道设备归属，目前做不到。
@@ -33,17 +61,23 @@ udev 规则只能按设备名（`libvirtualhid*`）打 `ID_SEAT`，区分不出�
 
 之前误判过一次。cage 用 `wlr_scene_output_commit` 渲染，headless 输出上画得出光标（用 `grim` 截图确认过）。所以"看不到指针"不是渲染问题。
 
-### 用 `grim` 加写事件做端到端自检
+### 端到端自检：截图加注入事件
 
-在一个实例的 Wayland socket 上截图，往它的虚拟鼠标设备写事件，再截一张对比：
+在一个实例的 Wayland socket 上截图，注入事件，再截一张对比：
 
 ```bash
-WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 grim /tmp/before.png
+export XDG_RUNTIME_DIR=/run/user/1000
+WAYLAND_DISPLAY=wayland-0 grim /tmp/before.png
 # 用 evdev 打开 /dev/input/eventN 写 ABS_X/ABS_Y 或 REL_X/REL_Y
-WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 grim /tmp/after.png
+WAYLAND_DISPLAY=wayland-0 grim /tmp/after.png
 ```
 
-画面有变化就说明 `uinput → libinput → cage → 应用` 是通的。`weston-eventdemo` 适合当被测应用，它的方块会跟着指针事件变色。
+两点注意：
+
+- 写 `/dev/input/eventN` 只在设备无人抓取时有效。虚拟键盘会被 keyd 抓走（见上一条），虚拟鼠标无人抓取，所以鼠标能这样测、键盘不能。
+- 应用在动画面时，逐像素差值淹没在画面自身的变化里。更可靠的办法是给应用开一个可查询的状态出口，例如 `mpv --input-ipc-server=/run/user/1000/mpv-alpha.sock`，然后查 `mouse-pos`、`pause`：注入后属性变化就说明事件到了客户端，不依赖像素比较。
+
+`weston-eventdemo` 适合当被测应用，它的方块会跟着指针事件变色。
 
 ## 配对
 
@@ -79,11 +113,13 @@ WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 grim /tmp/after.png
 
 `clippon-net.service` 用 `KillMode=process`，重启服务不会杀掉实例。代价是 systemd 记为 `Found left-over process ... in control group`，这些进程的资源限制和日志归属挂在 helper 的 unit 上。要更干净的话得给它们一个独立的 scope。
 
-### 重装服务会弹 KDE 钱包解锁框
+### 重启 clippond 会弹 KDE 钱包解锁框
 
-`systemctl --user restart clippond` 会让 KDE 那边的组件去请求会话 secret service，`ksecretd` 因为没有父窗口，直接把 `kdewallet` 的解锁对话框丢到桌面上。实测：只重启服务会弹，单纯用 `clipponctl` 启停实例不会弹。
+`systemctl --user restart clippond` 会让 KDE 那边的组件去请求会话 secret service，`ksecretd` 因为没有父窗口，直接把 `kdewallet` 的解锁对话框丢到桌面上。
 
-`install-daemon.py` 现在只在 unit 文本真的变了才重启，`enable --now` 覆盖首次安装和启动，所以重复安装不再触发。想彻底不弹，只能把 `kdewallet` 设成空密码。
+触发条件与"重装"无关，只要这个用户单元重启就会弹。2026-10-10 实测：手工 `systemctl --user restart clippond` 三次，三次都弹；`install-daemon.py` 那条"只在 unit 文本真的变了才重启"只覆盖了重装这条路径。
+
+真正的机制还没查清楚：为什么重启一个 python 服务会让 KDE 去解锁 `kdewallet`。想彻底不弹，目前的办法只有把 `kdewallet` 设成空密码。
 
 ## 会话
 
