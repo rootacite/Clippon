@@ -47,8 +47,10 @@ OFFICIAL_PACKAGES = (
 AUR_PACKAGE = "sunshine-beta-bin"
 SHIM_SOURCE = ROOT / "assets" / "seat_shim.c"
 UDEV_SOURCE = ROOT / "assets" / "99-sunshine-cage.rules"
+SEAT_TAG_SOURCE = ROOT / "assets" / "clippon-seat-tag"
 SHIM_INSTALL = SHIM_PATH
 UDEV_INSTALL = UDEV_RULE_PATH
+SEAT_TAG_INSTALL = Path("/usr/local/libexec/clippon-seat-tag")
 SOURCE_INSTALL = Path("/usr/local/src/libseat-seat-cage/seat_shim.c")
 LAUNCHER = ROOT / "bin" / "clippon"
 
@@ -109,6 +111,7 @@ def install(dry_run: bool) -> None:
         )
 
     install_shim(dry_run)
+    install_seat_tag(dry_run)
     install_udev(dry_run)
     install_launcher(dry_run)
     if dry_run:
@@ -235,6 +238,22 @@ def _require_symbol(path: Path) -> None:
         raise InstallError(f"{path} does not export libseat_seat_name")
 
 
+def install_seat_tag(dry_run: bool) -> None:
+    """Install the udev IMPORT helper the seat rule calls.
+
+    The rule maps each virtual device to a seat by reading the instance tag
+    that libclippon_vhid_name.so puts in the device name, so the helper has to
+    be in place before the rule is loaded.
+    """
+    if not SEAT_TAG_SOURCE.is_file():
+        raise InstallError(f"seat tag helper is missing: {SEAT_TAG_SOURCE}")
+    note("inst", "installing udev seat helper %s", SEAT_TAG_INSTALL)
+    run(
+        as_root(["install", "-Dm755", str(SEAT_TAG_SOURCE), str(SEAT_TAG_INSTALL)]),
+        dry_run=dry_run,
+    )
+
+
 def install_udev(dry_run: bool) -> None:
     if not UDEV_SOURCE.is_file():
         raise InstallError(f"udev rule is missing: {UDEV_SOURCE}")
@@ -287,6 +306,12 @@ def summary() -> None:
             warn("inst", "%-16s missing", name)
     note("inst", "%-16s %s", "shim", SHIM_INSTALL if SHIM_INSTALL.is_file() else "missing")
     note("inst", "%-16s %s", "udev", UDEV_INSTALL if UDEV_INSTALL.is_file() else "missing")
+    note(
+        "inst",
+        "%-16s %s",
+        "seat helper",
+        SEAT_TAG_INSTALL if SEAT_TAG_INSTALL.is_file() else "missing",
+    )
     launcher = user_home() / ".local" / "bin" / "clippon"
     note("inst", "%-16s %s", "command", launcher if launcher.exists() else "not linked")
     if os.geteuid() != 0 and not _dir_on_path(launcher.parent):

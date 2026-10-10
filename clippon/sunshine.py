@@ -84,20 +84,26 @@ def tray_plan(mode: str) -> TrayPlan:
     )
 
 
-def managed_env(addr_shim: Path) -> dict[str, str]:
-    """Environment that keeps a managed Sunshine off the host's mDNS and ports.
+def managed_env(vhid_shim: Path | None = None, tag: str = "") -> dict[str, str]:
+    """Environment for a managed Sunshine.
 
-    The address shim is loaded only into this process. Cage keeps the seat shim.
+    *vhid_shim* appends *tag* to every virtual input device name, which is how
+    the udev helper learns which instance a device belongs to. The address shim
+    that used to ride along here is not preloaded any more: the packaged binary
+    is capability-marked, so the loader ignored it all along, and the gateway
+    rewrites LocalIP and sessionUrl0 instead.
     """
     env = {"DBUS_SYSTEM_BUS_ADDRESS": DEAD_SYSTEM_BUS}
-    if addr_shim.is_file():
-        env["LD_PRELOAD"] = str(addr_shim)
-    else:
-        warn(
-            "sun",
-            "%s is missing; Moonlight will be told the namespace address",
-            addr_shim,
-        )
+    if vhid_shim is not None:
+        if vhid_shim.is_file() and tag:
+            env["LD_PRELOAD"] = str(vhid_shim)
+            env["CLIPPON_VHID_TAG"] = tag
+        elif not vhid_shim.is_file():
+            warn(
+                "sun",
+                "%s is missing; every instance's devices stay on one seat",
+                vhid_shim,
+            )
     return env
 
 

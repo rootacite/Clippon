@@ -1,9 +1,27 @@
-# Sunshine/libvirtualhid virtual input is put in its own seat, so the host
-# desktop (seat0) ignores it and only the headless cage reads it.
-# Companion: /usr/local/lib/libseat_seat_cage.so (LD_PRELOAD seat-name shim).
+# Sunshine/libvirtualhid virtual input goes to a seat of its own, so the host
+# desktop (seat0) ignores it and each clippon instance reads only its own
+# devices.
 #
-# WL_OUTPUT is the only way cage learns which output an absolute pointer
-# belongs to. Without it cage logs "cannot be mapped to an output device" and
-# the cursor never moves. HEADLESS-1 is the name wlroots gives the single
+# The seat depends on which instance created the device: Sunshine's libevdev
+# device names get an "@<instance>" suffix from libclippon_vhid_name.so, and
+# clippon-seat-tag turns that suffix into ID_SEAT=seat-cage-<instance>. A device
+# without a suffix keeps the shared "seat-cage", which covers single-instance
+# setups and older Sunshine binaries.
+#
+# The second rule repeats the seat tag on purpose: 73-seat-late.rules tags every
+# device with $env{ID_SEAT}, and it runs before this file.
+#
+# Companion pieces:
+#   /usr/local/lib/libseat_seat_cage.so    (cage reads the seat name from
+#                                           CLIPPON_SEAT, default seat-cage)
+#   /usr/local/lib/libclippon_vhid_name.so (Sunshine tags its device names)
+#   /usr/local/libexec/clippon-seat-tag    (this rule's IMPORT program)
+#
+# KERNEL=="event*" keeps the rule off the parent inputN device: the helper reads
+# the name from /sys/class/input/<event>/device/name, which only exists there.
+#
+# WL_OUTPUT is set for the absolute pointer. cage logs "cannot be mapped to an
+# output device" without it; HEADLESS-1 is the name wlroots gives the single
 # headless output (WLR_HEADLESS_OUTPUTS=1).
-ACTION=="add|change", SUBSYSTEM=="input", ATTRS{name}=="libvirtualhid*", ENV{ID_SEAT}="seat-cage", ENV{WL_OUTPUT}="HEADLESS-1"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="libvirtualhid*", IMPORT{program}="/usr/local/libexec/clippon-seat-tag %k", ENV{WL_OUTPUT}="HEADLESS-1"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="libvirtualhid*", TAG+="$env{ID_SEAT}"

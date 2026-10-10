@@ -25,6 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
+from clippon.config import SHIM_PATH, UDEV_RULE_PATH, VHID_SHIM_PATH
 from clippon.log import error, note, setup_logging, warn
 from clippon.units import system_unit, user_unit
 from install import InstallError, arch_name, as_root, as_user, run, user_home
@@ -33,6 +34,15 @@ ADDR_SOURCE = ROOT / "assets" / "sunshine_addr.c"
 ADDR_INSTALL = Path("/usr/local/lib/libsunshine_addr.so")
 CURSOR_SOURCE = ROOT / "assets" / "wlr_cursor_map.c"
 CURSOR_INSTALL = Path("/usr/local/lib/libwlr_cursor_map.so")
+SEAT_SHIM_SOURCE = ROOT / "assets" / "seat_shim.c"
+SEAT_SHIM_INSTALL = SHIM_PATH
+SEAT_SHIM_SOURCE_INSTALL = Path("/usr/local/src/libseat-seat-cage/seat_shim.c")
+VHID_SOURCE = ROOT / "assets" / "vhid_name.c"
+VHID_INSTALL = VHID_SHIM_PATH
+SEAT_TAG_SOURCE = ROOT / "assets" / "clippon-seat-tag"
+SEAT_TAG_INSTALL = Path("/usr/local/libexec/clippon-seat-tag")
+UDEV_SOURCE = ROOT / "assets" / "99-sunshine-cage.rules"
+UDEV_INSTALL = UDEV_RULE_PATH
 OWNER_PATH = Path("/var/lib/clippon/owner.json")
 SYSTEM_UNIT_PATH = Path("/etc/systemd/system/clippon-net.service")
 HELPER = ROOT / "bin" / "clippon-net"
@@ -77,8 +87,12 @@ def install(dry_run: bool) -> None:
     account = target_account()
     note("inst", "owner   %s (uid %s)", account.pw_name, account.pw_uid)
     ensure_tools(dry_run)
+    install_seat_shim(dry_run)
     install_addr_shim(dry_run)
     install_cursor_shim(dry_run)
+    install_vhid_shim(dry_run)
+    install_seat_tag(dry_run)
+    install_udev(dry_run)
     install_owner(account, dry_run)
     install_units(account, dry_run)
     fix_checkout_modes(dry_run)
@@ -138,6 +152,39 @@ def _has_cryptography() -> bool:
     )
 
 
+def install_seat_shim(dry_run: bool) -> None:
+    """Build the cage-side seat shim.
+
+    install.py installs this shim as well. Repeating it here keeps the daemon
+    install self-contained, which matters because the shim reads CLIPPON_SEAT
+    and a stale copy silently puts every instance back on one seat.
+    """
+    if not SEAT_SHIM_SOURCE.is_file():
+        raise InstallError(f"shim source is missing: {SEAT_SHIM_SOURCE}")
+    note("inst", "building libseat seat shim")
+    if dry_run:
+        note("inst", "$ gcc -shared -fPIC -O2 -o libseat_seat_cage.so %s", SEAT_SHIM_SOURCE)
+        note("inst", "would install %s", SEAT_SHIM_INSTALL)
+        return
+    with tempfile.TemporaryDirectory(prefix="clippon-seat-") as temporary:
+        built = Path(temporary) / "libseat_seat_cage.so"
+        run(
+            ["gcc", "-shared", "-fPIC", "-O2", "-o", str(built), str(SEAT_SHIM_SOURCE)],
+            dry_run=False,
+        )
+        _require_symbol(built, "libseat_seat_name")
+        staged = SEAT_SHIM_INSTALL.with_name(SEAT_SHIM_INSTALL.name + ".new")
+        run(as_root(["install", "-Dm644", str(built), str(staged)]), dry_run=False)
+        run(as_root(["mv", "-f", str(staged), str(SEAT_SHIM_INSTALL)]), dry_run=False)
+        run(
+            as_root(
+                ["install", "-Dm644", str(SEAT_SHIM_SOURCE), str(SEAT_SHIM_SOURCE_INSTALL)]
+            ),
+            dry_run=False,
+        )
+    note("inst", "shim  %s", SEAT_SHIM_INSTALL)
+
+
 def install_addr_shim(dry_run: bool) -> None:
     if not ADDR_SOURCE.is_file():
         raise InstallError(f"shim source is missing: {ADDR_SOURCE}")
@@ -180,6 +227,49 @@ def install_cursor_shim(dry_run: bool) -> None:
         run(as_root(["install", "-Dm644", str(built), str(staged)]), dry_run=False)
         run(as_root(["mv", "-f", str(staged), str(CURSOR_INSTALL)]), dry_run=False)
     note("inst", "shim  %s", CURSOR_INSTALL)
+
+
+def install_vhid_shim(dry_run: bool) -> None:
+    if not VHID_SOURCE.is_file():
+        raise InstallError(f"shim source is missing: {VHID_SOURCE}")
+    note("inst", "building virtual input name shim")
+    if dry_run:
+        note("inst", "$ gcc -shared -fPIC -O2 -o libclippon_vhid_name.so %s", VHID_SOURCE)
+        note("inst", "would install %s", VHID_INSTALL)
+        return
+    with tempfile.TemporaryDirectory(prefix="clippon-vhid-") as temporary:
+        built = Path(temporary) / "libclippon_vhid_name.so"
+        run(
+            ["gcc", "-shared", "-fPIC", "-O2", "-o", str(built), str(VHID_SOURCE)],
+            dry_run=False,
+        )
+        _require_symbol(built, "libevdev_set_name")
+        staged = VHID_INSTALL.with_name(VHID_INSTALL.name + ".new")
+        run(as_root(["install", "-Dm644", str(built), str(staged)]), dry_run=False)
+        run(as_root(["mv", "-f", str(staged), str(VHID_INSTALL)]), dry_run=False)
+    note("inst", "shim  %s", VHID_INSTALL)
+
+
+def install_seat_tag(dry_run: bool) -> None:
+    if not SEAT_TAG_SOURCE.is_file():
+        raise InstallError(f"seat tag helper is missing: {SEAT_TAG_SOURCE}")
+    note("inst", "installing udev seat helper %s", SEAT_TAG_INSTALL)
+    run(
+        as_root(["install", "-Dm755", str(SEAT_TAG_SOURCE), str(SEAT_TAG_INSTALL)]),
+        dry_run=dry_run,
+    )
+
+
+def install_udev(dry_run: bool) -> None:
+    if not UDEV_SOURCE.is_file():
+        raise InstallError(f"udev rule is missing: {UDEV_SOURCE}")
+    note("inst", "installing udev rule %s", UDEV_INSTALL)
+    run(as_root(["install", "-Dm644", str(UDEV_SOURCE), str(UDEV_INSTALL)]), dry_run=dry_run)
+    run(as_root(["udevadm", "control", "--reload-rules"]), dry_run=dry_run)
+    run(
+        as_root(["udevadm", "trigger", "--subsystem-match=input", "--action=change"]),
+        dry_run=dry_run,
+    )
 
 
 def _require_getsockname(path: Path) -> None:

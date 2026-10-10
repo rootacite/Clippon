@@ -34,15 +34,25 @@ def check(cfg: Config) -> None:
             cfg.udev_rule,
         )
 
+    if cfg.udev_rule.exists():
+        text = cfg.udev_rule.read_text(encoding="utf-8", errors="replace")
+        if "clippon-seat-tag" not in text:
+            warn(
+                "seat",
+                "%s does not call clippon-seat-tag: every instance's input will "
+                "reach the other instances' apps",
+                cfg.udev_rule,
+            )
+
     # Managed instances each have a network namespace, so another host sunshine
     # is not competing for these ports.
     if not cfg.instance and _sunshine_running():
         warn("sun", "another sunshine is already running; this one may fail to bind its ports")
-    if cfg.instance and not cfg.addr_shim.is_file():
+    if cfg.instance and not cfg.vhid_shim.is_file():
         warn(
             "sun",
-            "%s is missing; Moonlight will be told the namespace address",
-            cfg.addr_shim,
+            "%s is missing; every instance's devices stay on one seat",
+            cfg.vhid_shim,
         )
 
     if cfg.resolution and not _have("wlr-randr"):

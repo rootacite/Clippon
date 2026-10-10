@@ -23,7 +23,7 @@ from clippon.cage import (
     wayland_names,
 )
 from clippon.config import ClipponError, Config
-from clippon.instance import instance_dir, state_home
+from clippon.instance import instance_dir, instance_seat, state_home
 from clippon.log import add_log_file, block, debug, error, note, warn
 from clippon.preflight import check
 from clippon.proc import RemoteProcess, kill, reap, shell_status, signal_group, terminate, wait_gone
@@ -127,6 +127,7 @@ class Session:
                 self._handles["cage"],
                 self.cfg.shim,
                 self.cfg.cursor_shim,
+                seat=instance_seat(self.cfg.instance, self.cfg.vhid_shim),
             )
         except OSError as exc:
             raise ClipponError(f"cannot start cage: {exc}") from exc
@@ -293,7 +294,7 @@ class Session:
     def _sunshine_env(self) -> dict[str, str]:
         if not self.cfg.instance:
             return {}
-        return managed_env(self.cfg.addr_shim)
+        return managed_env(self.cfg.vhid_shim, f"@{self.cfg.instance}")
 
     def _stop_sunshine(self) -> None:
         if self.sun is None:

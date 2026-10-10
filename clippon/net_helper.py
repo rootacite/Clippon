@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import pwd
+import shutil
 import signal
 import socket
 import stat
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from clippon.instance import validate_name
-from clippon.log import error, note, setup_logging
+from clippon.log import error, note, warn, setup_logging
 from clippon.ports import (
     BRIDGE,
     BRIDGE_IP,
@@ -35,6 +36,50 @@ from clippon.protocol import HELPER_SOCK, recv_obj, send_obj
 
 STATE_PATH = Path("/var/lib/clippon/state.json")
 OWNER_PATH = Path("/var/lib/clippon/owner.json")
+SUNSHINE_BIN = Path("/usr/bin/sunshine")
+SUNSHINE_SPAWN = Path("/usr/local/lib/clippon/sunshine")
+
+
+def sunshine_spawn_path() -> str:
+    """The Sunshine binary to exec: a copy without file capabilities.
+
+    The packaged binary carries cap_sys_admin=p. The kernel marks every exec of
+    a capable binary secure, and the loader then ignores LD_PRELOAD, so the
+    device-name shim never loads. A headless cage session keeps capture on
+    wlr-screencopy instead of KMS, so that capability buys nothing here and the
+    copy is what lets each instance's devices carry their instance tag.
+
+    Falls back to PATH lookup when the packaged binary is somewhere else.
+    """
+    if not SUNSHINE_BIN.is_file():
+        return "sunshine"
+    try:
+        source = SUNSHINE_BIN.stat()
+        stale = True
+        if SUNSHINE_SPAWN.is_file():
+            copy = SUNSHINE_SPAWN.stat()
+            stale = (copy.st_size, copy.st_mtime_ns) != (source.st_size, source.st_mtime_ns)
+        if stale:
+            SUNSHINE_SPAWN.parent.mkdir(parents=True, exist_ok=True)
+            staged = SUNSHINE_SPAWN.with_name(SUNSHINE_SPAWN.name + ".new")
+            # copyfile, not copy2: copystat would carry security.capability over.
+            shutil.copyfile(SUNSHINE_BIN, staged)
+            os.chmod(staged, 0o755)
+            # Keep the source's timestamp so the next spawn sees it as current,
+            # and rename into place so a running instance keeps its own inode.
+            os.utime(staged, ns=(source.st_atime_ns, source.st_mtime_ns))
+            os.replace(staged, SUNSHINE_SPAWN)
+            note("net", "refreshed %s from %s", SUNSHINE_SPAWN, SUNSHINE_BIN)
+    except OSError as exc:
+        warn(
+            "net",
+            "cannot prepare %s: %s; this instance's devices stay untagged and its "
+            "cage will not see them",
+            SUNSHINE_SPAWN,
+            exc,
+        )
+        return "sunshine"
+    return str(SUNSHINE_SPAWN)
 
 
 class HelperError(Exception):
@@ -354,6 +399,8 @@ class Helper:
             raise HelperError(f"missing netns {ns_path}")
         log = _open_user_log(stdout, self.owner.uid)
         if in_netns:
+            if Path(argv[0]).name == "sunshine":
+                argv = [sunshine_spawn_path(), *argv[1:]]
             cmd = spawn_command(str(ns_path), self.owner.user, self.owner.gid, argv)
         else:
             cmd = host_command(self.owner.user, self.owner.gid, argv)

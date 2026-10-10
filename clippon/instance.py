@@ -20,6 +20,28 @@ def validate_name(name: str) -> None:
         )
 
 
+def seat_name(instance: str) -> str:
+    """The libinput seat an instance's cage reads.
+
+    Empty instance means the shared seat, which is what a plain single-instance
+    run and any untagged device use.
+    """
+    return f"seat-cage-{instance}" if instance else "seat-cage"
+
+
+def instance_seat(instance: str, vhid_shim: Path) -> str:
+    """The seat to start this instance's cage on, or "" for the shared one.
+
+    Without the name shim Sunshine cannot tag its devices, so a cage on a
+    per-instance seat would find nothing at all. Falling back to the shared
+    seat trades cross-talk for a working input path, which is what an instance
+    started without the shim gets today.
+    """
+    if not instance or not vhid_shim.is_file():
+        return ""
+    return seat_name(instance)
+
+
 def state_home(env: Mapping[str, str] | None = None) -> Path:
     values = os.environ if env is None else env
     chosen = values.get("XDG_STATE_HOME")

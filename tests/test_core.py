@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import io
+import os
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from contextlib import redirect_stdout
 from pathlib import Path
 
 from clippon.audio import AudioInstance, pipewire_dropin, wireplumber_dropin
-from clippon.cage import client_argv, wayland_socket_on_line
+from clippon.cage import cage_environment, client_argv, wayland_socket_on_line
 from clippon.config import DEFAULT_RES, ClipponError, parse_args, resolution_ok
 from clippon.ctl import format_list, parse_ctl
 from clippon.daemon import clippon_argv
@@ -22,8 +25,16 @@ from clippon.gateway import (
     serverinfo_xml,
     xml_text,
 )
-from clippon.instance import apps_document, sunshine_conf, validate_name, write_instance
+from clippon.instance import (
+    apps_document,
+    instance_seat,
+    seat_name,
+    sunshine_conf,
+    validate_name,
+    write_instance,
+)
 from clippon.net_helper import spawn_command
+from clippon import net_helper
 from clippon.pair import Pairing
 from clippon.ports import allocate_host, docker_user_checks, lan_from_ip_json, nft_table
 from clippon.proc import env_has_pair, shell_status
@@ -147,6 +158,85 @@ class TrayTests(unittest.TestCase):
         self.assertEqual(managed_tray("auto"), "disabled")
         self.assertEqual(managed_tray("disabled"), "disabled")
         self.assertEqual(managed_tray("enabled"), "enabled")
+
+
+class SeatTests(unittest.TestCase):
+    """The per-instance seat: one cage reads one instance's devices."""
+
+    def test_seat_name_follows_the_instance(self) -> None:
+        self.assertEqual(seat_name(""), "seat-cage")
+        self.assertEqual(seat_name("desk"), "seat-cage-desk")
+
+    def test_instance_seat_needs_the_name_shim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            shim = Path(directory) / "libclippon_vhid_name.so"
+            missing = Path(directory) / "absent.so"
+            self.assertEqual(instance_seat("desk", missing), "")
+            self.assertEqual(instance_seat("", shim), "")
+            shim.write_bytes(b"")
+            self.assertEqual(instance_seat("desk", shim), "seat-cage-desk")
+
+    def test_cage_environment_reports_the_instance_seat(self) -> None:
+        env = cage_environment({}, seat="seat-cage-desk")
+        self.assertEqual(env["CLIPPON_SEAT"], "seat-cage-desk")
+        self.assertIn("libseat_seat_cage.so", env["LD_PRELOAD"])
+        plain = cage_environment({})
+        self.assertNotIn("CLIPPON_SEAT", plain)
+
+    def test_managed_sunshine_env_tags_the_device_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            vhid = Path(directory) / "libclippon_vhid_name.so"
+            vhid.write_bytes(b"")
+            env = managed_env(vhid, "@desk")
+        self.assertEqual(env["CLIPPON_VHID_TAG"], "@desk")
+        self.assertEqual(env["LD_PRELOAD"], str(vhid))
+
+    def test_missing_vhid_shim_leaves_devices_untagged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "not-built.so"
+            env = managed_env(missing, "@desk")
+        self.assertNotIn("CLIPPON_VHID_TAG", env)
+        self.assertNotIn("LD_PRELOAD", env)
+
+    def test_sunshine_is_spawned_from_a_capability_free_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "sunshine"
+            copy = root / "clippon" / "sunshine"
+            source.write_bytes(b"first")
+            with mock.patch.object(net_helper, "SUNSHINE_BIN", source), mock.patch.object(
+                net_helper, "SUNSHINE_SPAWN", copy
+            ):
+                self.assertEqual(net_helper.sunshine_spawn_path(), str(copy))
+                self.assertEqual(copy.read_bytes(), b"first")
+                source.write_bytes(b"second")
+                os.utime(source, (1, 1))
+                self.assertEqual(net_helper.sunshine_spawn_path(), str(copy))
+                self.assertEqual(copy.read_bytes(), b"second")
+            with mock.patch.object(net_helper, "SUNSHINE_BIN", root / "absent"):
+                self.assertEqual(net_helper.sunshine_spawn_path(), "sunshine")
+
+    def test_seat_tag_helper_maps_the_device_name(self) -> None:
+        helper = Path(__file__).resolve().parent.parent / "assets" / "clippon-seat-tag"
+        with tempfile.TemporaryDirectory() as directory:
+            sysfs = Path(directory)
+            for kernel, name in (("event9", "libvirtualhid Keyboard@desk"),
+                                 ("event10", "libvirtualhid Mouse")):
+                (sysfs / kernel / "device").mkdir(parents=True)
+                (sysfs / kernel / "device" / "name").write_text(name, encoding="utf-8")
+            env = dict(os.environ, CLIPPON_SYSFS=str(sysfs))
+            tagged = subprocess.run(
+                [str(helper), "event9"], env=env, capture_output=True, text=True, check=True
+            )
+            plain = subprocess.run(
+                [str(helper), "event10"], env=env, capture_output=True, text=True, check=True
+            )
+            unknown = subprocess.run(
+                [str(helper), "event99"], env=env, capture_output=True, text=True, check=True
+            )
+        self.assertEqual(tagged.stdout.strip(), "ID_SEAT=seat-cage-desk")
+        self.assertEqual(plain.stdout.strip(), "ID_SEAT=seat-cage")
+        self.assertEqual(unknown.stdout.strip(), "ID_SEAT=seat-cage")
 
 
 class FatalLineTests(unittest.TestCase):
@@ -331,13 +421,10 @@ class SpawnCommandTests(unittest.TestCase):
         self.assertIn("--verbose", argv)
         self.assertEqual(argv[-6:], ["--res", "1920x1080", "--", "kitty", "-e", "sh"])
 
-    def test_managed_sunshine_env_points_at_the_shim(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            shim = Path(directory) / "libsunshine_addr.so"
-            shim.write_bytes(b"")
-            env = managed_env(shim)
-        self.assertEqual(env["LD_PRELOAD"], str(shim))
+    def test_managed_sunshine_env_keeps_sunshine_off_the_system_bus(self) -> None:
+        env = managed_env()
         self.assertTrue(env["DBUS_SYSTEM_BUS_ADDRESS"].startswith("unix:path="))
+        self.assertNotIn("LD_PRELOAD", env)
 
     def test_units_name_the_launchers(self) -> None:
         system = system_unit("/usr/bin/python3", "/repo/bin/clippon-net")

@@ -45,11 +45,14 @@ def cage_environment(
     audio_env: dict[str, str],
     shim: Path = SHIM_PATH,
     cursor_shim: Path = CURSOR_SHIM_PATH,
+    seat: str = "",
 ) -> dict[str, str]:
     """Environment for cage itself. The client wrapper drops LD_PRELOAD again.
 
     Two shims ride along: the seat-name override, and the cursor mapping that
-    stands in for the WL_OUTPUT property wlroots 0.20 does not read.
+    stands in for the WL_OUTPUT property wlroots 0.20 does not read. *seat* is
+    the name the override reports, so this instance reads only the devices
+    udev tagged for it.
     """
     env = os.environ.copy()
     env.pop("WAYLAND_DISPLAY", None)
@@ -68,6 +71,8 @@ def cage_environment(
             "LD_PRELOAD": ":".join(preload),
         }
     )
+    if seat:
+        env["CLIPPON_SEAT"] = seat
     return env
 
 
@@ -78,10 +83,11 @@ def start_cage(
     log_file: object,
     shim: Path = SHIM_PATH,
     cursor_shim: Path = CURSOR_SHIM_PATH,
+    seat: str = "",
 ) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         ["cage", "--", *client_argv(command, resolution)],
-        env=cage_environment(audio_env, shim, cursor_shim),
+        env=cage_environment(audio_env, shim, cursor_shim, seat),
         stdout=log_file,  # type: ignore[arg-type]
         stderr=subprocess.STDOUT,
     )

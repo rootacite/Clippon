@@ -1,0 +1,17 @@
+#!/bin/sh
+# udev helper: print the libinput seat for one of Clippon's virtual devices.
+#
+# Sunshine creates its keyboard, mice and touch/pen devices through
+# libvirtualhid. assets/vhid_name.c appends "@<instance>" to each device name,
+# so the seat follows from the name and no per-instance udev rule is needed.
+# Untagged devices keep the shared seat, which is how a single-instance setup
+# and any older Sunshine binary behave.
+#
+# usage: clippon-seat-tag %k      (udev IMPORT{program}, prints ID_SEAT=...)
+set -u
+sysfs=${CLIPPON_SYSFS:-/sys/class/input}
+name=$(cat "$sysfs/$1/device/name" 2>/dev/null || true)
+case "$name" in
+	*@*) printf 'ID_SEAT=seat-cage-%s\n' "${name##*@}" ;;
+	*) printf 'ID_SEAT=seat-cage\n' ;;
+esac

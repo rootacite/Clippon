@@ -13,6 +13,7 @@ from clippon.instance import instance_dir, validate_name
 SHIM_PATH = Path("/usr/local/lib/libseat_seat_cage.so")
 ADDR_SHIM_PATH = Path("/usr/local/lib/libsunshine_addr.so")
 CURSOR_SHIM_PATH = Path("/usr/local/lib/libwlr_cursor_map.so")
+VHID_SHIM_PATH = Path("/usr/local/lib/libclippon_vhid_name.so")
 UDEV_RULE_PATH = Path("/etc/udev/rules.d/99-sunshine-cage.rules")
 DEFAULT_RES = "2560x1440@120Hz"
 DEFAULT_SINK = "cage-sink"
@@ -88,6 +89,7 @@ class Config:
     shim: Path = SHIM_PATH
     addr_shim: Path = ADDR_SHIM_PATH
     cursor_shim: Path = CURSOR_SHIM_PATH
+    vhid_shim: Path = VHID_SHIM_PATH
     udev_rule: Path = UDEV_RULE_PATH
 
     @property

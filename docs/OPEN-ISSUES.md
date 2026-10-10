@@ -53,29 +53,6 @@ DEVICE: ignoring 1209:0003:684dc0b3                           (libvirtualhid Mou
 
 副作用备注：keyd 不在时，`rightalt = rightmeta` 这条改键也不再生效。
 
-### 两个 cage 会同时打开同一组虚拟设备
-
-udev 规则只能按设备名（`libvirtualhid*`）打 `ID_SEAT`，区分不出设备属于哪个实例。所以每个实例的 cage 都会打开全部设备，键盘和鼠标都是。2026-10-10 实测（`/proc/<pid>/fd` 逐个读链接）：
-
-```text
-event25..event30  ->  cage-alpha(618420), cage-beta(618640) 两者都持有
-```
-
-现象：在 alpha 里按 `←`，beta 里正在播放的视频也倒放；鼠标同理，两个应用都收到同一串指针事件。
-
-难点在于设备上没有任何区分实例的信息：两套设备的 `name` 完全相同（`libvirtualhid Keyboard` / `Mouse` / `Mouse (Absolute)` / `Touchscreen` / `Pen Tablet`），`phys` 与 `uniq` 都是空的，sysfs 路径都是 `/devices/virtual/input/inputN/`，udev 属性只有 `ID_SEAT=seat-cage` 和 `ID_SERIAL=noserial`。内核也不暴露 uinput 设备的创建者，所以"这个设备属于哪个实例"无法事后推断。另外 Sunshine 会在客户端连上时按需补建触摸屏与笔设备（本次 21:17:44 出现一对），任何靠启动时间推断归属的做法都不成立。
-
-可行的修复方向（待做）：给设备加一个实例标记，再按标记分 seat。
-
-- Sunshine 动态链接 `libevdev.so.2`，并调用 `libevdev_set_name@LIBEVDEV_1`（`nm -D` 可见未定义符号），所以可以用一个新的 `LD_PRELOAD` 垫片拦截它，在设备名后追加 `@<实例名>`。
-- udev 侧按名字里的 `@<实例名>` 给不同 seat（helper 为每个实例写一条规则，或用一条 `IMPORT{program}` 规则解析名字）。
-- 现有座位垫片 `assets/seat_shim.c` 改为从环境变量取 seat 名（例如 `CLIPPON_SEAT=seat-cage-alpha`），回退到现在的 `seat-cage`。
-- 这条链路成立的前提已核实：wlroots 用的是 libinput 的 udev 后端（`libinput_udev_create_context` + `libinput_udev_assign_seat`），所以 seat 名与 `ID_SEAT` 决定每个 cage 拿到哪些设备。
-
-未打标记的设备仍然回落到 `seat-cage`，所以新旧混用时旧实例的行为与今天一致。
-
-另一条消除它的路是让实例进程只在会话期存在（同一时刻只驻留一个实例），已核实可行但暂不实施，见 `docs/DESIGN-ondemand-backend.md`。
-
 ### 光标渲染是正常的
 
 之前误判过一次。cage 用 `wlr_scene_output_commit` 渲染，headless 输出上画得出光标（用 `grim` 截图确认过）。所以"看不到指针"不是渲染问题。

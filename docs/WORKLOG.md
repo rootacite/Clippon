@@ -66,6 +66,36 @@ Clippon：在一台机器上并行运行多个 Sunshine 实例，让 Moonlight �
 
 `alpha` 没有重启，进程仍走旧路径，下次重启时生效。单元测试 35 项通过。
 
+### 七、每个实例独立的 libinput seat
+
+之前每个 cage 都会打开**全部**实例的虚拟键鼠：udev 把 `libvirtualhid*` 设备统统打上 `ID_SEAT=seat-cage`，而每个 cage 的座位名也是 `seat-cage`。现象是在 alpha 里按 `←`，beta 里正在播放的视频也倒放；`/proc/<pid>/fd` 实测两个 cage 各自持有 event25–event30 六个设备。设备本身没有任何可区分实例的信息：两套设备名完全相同，`phys`、`uniq` 都是空的，内核也不暴露 uinput 设备的创建者。
+
+现在按实例分 seat，链路是：
+
+- `assets/vhid_name.c`：`LD_PRELOAD` 进 Sunshine，拦截 `libevdev_set_name`，在设备名后追加 `@<实例名>`（设备名变成 `libvirtualhid Keyboard@alpha`）。Sunshine 动态链接 `libevdev.so.2` 并引用 `libevdev_set_name@LIBEVDEV_1`，符号可被拦截。
+- `assets/clippon-seat-tag`：udev 的 `IMPORT{program}` 助手，从 `%k` 读 `/sys/class/input/<event>/device/name`，把后缀变成 `ID_SEAT=seat-cage-<实例名>`；没有后缀的设备仍落到共享的 `seat-cage`。
+- `assets/seat_shim.c`：座位名改从 `CLIPPON_SEAT` 读取，回退到 `seat-cage`。
+- `clippon/net_helper.py`：spawn Sunshine 时换用一个**去掉 file capabilities 的副本**（`/usr/local/lib/clippon/sunshine`）。打包的 `/usr/bin/sunshine` 带 `cap_sys_admin=p`，内核因此给进程打上 secure 标记，加载器会直接忽略 `LD_PRELOAD` —— 加 ambient caps 也没用（执行带 file caps 的二进制时 ambient 会被清掉）。headless cage 会话里采集走 wlr-screencopy，用不到这个 capability。副本按「大小+时间戳」与源比对，有变化才用临时文件加 `os.replace` 换上去，避免正在运行的实例被 `ETXTBSY` 挡住。
+- `install-daemon.py` 现在也安装座位垫片。它此前只装地址/光标/名字垫片和 udev 规则，座位垫片依赖 `install.py`，于是改动后的垫片没有落盘，cage 仍报 `seat-cage`，改完标记后所有设备反而谁都看不见——排查时最费时间的一环。
+
+验证（2026-10-10 21:34）：
+
+```text
+event23  libvirtualhid Keyboard@alpha          ID_SEAT=seat-cage-alpha
+event26  libvirtualhid Keyboard@beta           ID_SEAT=seat-cage-beta
+cage 627443（alpha）持有: event23, event24, event25
+cage 627654（beta） 持有: event26, event27, event28
+```
+
+功能验证（往 alpha 的设备注入事件，读两边 mpv 自己的状态）：
+
+- 键盘：`KEY_SPACE` 让 alpha 的 `pause` 由 `False` 变 `True`，beta 保持 `False`；再按一次恢复。
+- 鼠标：相对位移让 alpha 的 `mouse-pos` 从 `(640,360)` 变 `(834,501)`，beta 停在 `(640,360)`。
+
+兜底：名字垫片不在时 `instance_seat()` 返回空串，cage 留在共享 seat，退化成"串扰但可用"，而不是"收不到任何输入"。
+
+顺带发现：地址垫片 `libsunshine_addr.so` 一直没生效（同样因为 file caps 让 `LD_PRELOAD` 被忽略），现在也不再预加载进 Sunshine —— `LocalIP` 与 `sessionUrl0` 由网关改写。
+
 ## 当前状态
 
 - `clippon-net` 与 `clippond` 都在运行。
