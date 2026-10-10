@@ -89,6 +89,29 @@ WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 grim /tmp/after.png
 
 `install-daemon.py` 现在只在 unit 文本真的变了才重启，`enable --now` 覆盖首次安装和启动，所以重复安装不再触发。想彻底不弹，只能把 `kdewallet` 设成空密码。
 
+## 会话
+
+### 客户端退出后，后端会一直报告 BUSY
+
+Sunshine 的 app 条目没有 `cmd`，走的是 placebo 分支（`src/process.cpp:284-286`），`proc::proc.running()` 一直返回 appid，直到有人显式停掉它。唯一会停它的是 `/cancel`（`src/nvhttp.cpp:1554-1575`），placebo 自己不会结束。
+
+而 Moonlight 只在与服务端"优雅结束"且设置项 `quitAppAfter` 为真时才发 `/cancel`（`app/streaming/session.cpp:1276`），这个设置项默认是 **false**（`app/settings/streamingpreferences.cpp:137`）。于是客户端正常退出后，后端的 placebo 应用继续存在，网关的 `serverinfo` 把它报成 `SUNSHINE_SERVER_BUSY` 加上那个应用的外部 ID。
+
+实测（2026-10-10 20:32，alpha 的会话在 20:04:40 就断了）：
+
+```text
+alpha  http://10.200.0.2:47989/serverinfo   currentgame=994642064  state=SUNSHINE_SERVER_BUSY
+beta   http://10.200.0.3:47989/serverinfo   currentgame=0          state=SUNSHINE_SERVER_FREE
+```
+
+直接后果：Moonlight 的主机项长期显示"正在运行某个应用"，`serverinfo` 的 `currentgame` 也不再归零。真正会出错的情形是 `/launch`：Sunshine 在已有应用运行时拒绝启动，返回 `An app is already running on this host`（`src/nvhttp.cpp:1376-1380`）。客户端按自己缓存的 `currentGameId` 决定发 `/launch` 还是 `/resume`，缓存过期时就会撞上这个拒绝。
+
+两条处理路子：
+
+- 客户端侧，零代码：在 Moonlight 设置里打开"会话结束后退出应用"（`quitAppAfter`），优雅退出时就会发 `/cancel`，网关照原样转发给对应后端。硬断线仍然不会发。
+- 网关侧，加固：`/launch` 命中某个后端时，如果该后端 `currentgame > 0`，先向它发一次 `/cancel` 再转发，让重复启动变成幂等。这条不需要新的存活探测。
+- 更彻底的：用 nft 计数器之类的内核侧信号判断流是否真的活着，不活跃就自动收掉后端。需要 helper 增加计数器操作。
+
 ## 音频
 
 ### 每个实例的 pipewire-pulse 在真实会话总线上抢注 D-Bus 名字
