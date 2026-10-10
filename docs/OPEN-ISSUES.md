@@ -49,11 +49,30 @@ DEVICE: ignoring 1209:0003:684dc0b3                           (libvirtualhid Mou
 -1209:0002
 ```
 
-现状：为做上面的验证停了一次 `keyd.service`，而它的 unit 文件与二进制都已经不在磁盘上（`/usr/lib/systemd/system/keyd.service` 缺失、`multi-user.target.wants/keyd.service` 是悬空符号链接、`pacman -Qs keyd` 为空），进程此前是靠内存里加载的单元跑了 2 天 4 小时，所以 `systemctl start keyd` 现在报 `Unit keyd.service not found`。要恢复得重装 keyd 包。副作用是 `rightalt = rightmeta` 这条改键暂时失效，同时键盘进应用这条路径现在是通的。
+现状：keyd 是用户主动卸载的（二进制与 unit 文件都已不在磁盘上，`pacman -Qs keyd` 为空），本机不再需要它，所以这条不是待修项，只作为机制记录。若将来重新安装 keyd，必须同时加上面的 `[ids]` 排除，否则虚拟键盘会再次被它抓走。
+
+副作用备注：keyd 不在时，`rightalt = rightmeta` 这条改键也不再生效。
 
 ### 两个 cage 会同时打开同一组虚拟设备
 
-udev 规则只能按设备名（`libvirtualhid*`）打 `ID_SEAT`，区分不出设备属于哪个实例。所以两个实例都在跑时，两边的 cage 会各自打开全部设备。同一时刻只有一路在推流，实际影响是另一侧的 cage 白拿一份事件。要彻底分开得让每个实例有独立的 seat 名，那需要让 udev 知道设备归属，目前做不到。
+udev 规则只能按设备名（`libvirtualhid*`）打 `ID_SEAT`，区分不出设备属于哪个实例。所以每个实例的 cage 都会打开全部设备，键盘和鼠标都是。2026-10-10 实测（`/proc/<pid>/fd` 逐个读链接）：
+
+```text
+event25..event30  ->  cage-alpha(618420), cage-beta(618640) 两者都持有
+```
+
+现象：在 alpha 里按 `←`，beta 里正在播放的视频也倒放；鼠标同理，两个应用都收到同一串指针事件。
+
+难点在于设备上没有任何区分实例的信息：两套设备的 `name` 完全相同（`libvirtualhid Keyboard` / `Mouse` / `Mouse (Absolute)` / `Touchscreen` / `Pen Tablet`），`phys` 与 `uniq` 都是空的，sysfs 路径都是 `/devices/virtual/input/inputN/`，udev 属性只有 `ID_SEAT=seat-cage` 和 `ID_SERIAL=noserial`。内核也不暴露 uinput 设备的创建者，所以"这个设备属于哪个实例"无法事后推断。另外 Sunshine 会在客户端连上时按需补建触摸屏与笔设备（本次 21:17:44 出现一对），任何靠启动时间推断归属的做法都不成立。
+
+可行的修复方向（待做）：给设备加一个实例标记，再按标记分 seat。
+
+- Sunshine 动态链接 `libevdev.so.2`，并调用 `libevdev_set_name@LIBEVDEV_1`（`nm -D` 可见未定义符号），所以可以用一个新的 `LD_PRELOAD` 垫片拦截它，在设备名后追加 `@<实例名>`。
+- udev 侧按名字里的 `@<实例名>` 给不同 seat（helper 为每个实例写一条规则，或用一条 `IMPORT{program}` 规则解析名字）。
+- 现有座位垫片 `assets/seat_shim.c` 改为从环境变量取 seat 名（例如 `CLIPPON_SEAT=seat-cage-alpha`），回退到现在的 `seat-cage`。
+- 这条链路成立的前提已核实：wlroots 用的是 libinput 的 udev 后端（`libinput_udev_create_context` + `libinput_udev_assign_seat`），所以 seat 名与 `ID_SEAT` 决定每个 cage 拿到哪些设备。
+
+未打标记的设备仍然回落到 `seat-cage`，所以新旧混用时旧实例的行为与今天一致。
 
 另一条消除它的路是让实例进程只在会话期存在（同一时刻只驻留一个实例），已核实可行但暂不实施，见 `docs/DESIGN-ondemand-backend.md`。
 
