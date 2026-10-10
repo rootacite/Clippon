@@ -197,6 +197,7 @@ AssetType=0                    200，仍由后端回答（Sunshine 自己的 600
 ## 目录
 
 ```text
+README.md   面向使用者的说明：这有什么用、原理、安装与命令
 assets/     C 垫片源码与 udev 规则
 bin/        clippon、clippond、clippon-net、clipponctl 启动器
 clippon/    包本体
