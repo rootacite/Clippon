@@ -105,6 +105,36 @@ def process_has_env(pid: int, key: str, value: str) -> bool:
     return env_has_pair(blob, key, value)
 
 
+def env_value(blob: bytes, key: str) -> str | None:
+    """The value of one environment variable in a /proc/<pid>/environ blob."""
+    prefix = f"{key}=".encode()
+    for item in blob.split(b"\0"):
+        if item.startswith(prefix):
+            return item[len(prefix) :].decode("utf-8", "replace")
+    return None
+
+
+def process_env_value(pid: int, key: str) -> str | None:
+    try:
+        blob = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    return env_value(blob, key)
+
+
+def all_pids() -> list[int]:
+    """Every pid on the host. Slower than pids_named, so use it only to sweep."""
+    found: list[int] = []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        if entry.name.isdigit():
+            found.append(int(entry.name))
+    return found
+
+
 def pids_named(name: str) -> list[int]:
     try:
         proc = subprocess.run(

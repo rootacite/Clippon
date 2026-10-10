@@ -33,11 +33,11 @@ from clippon.instance import (
     validate_name,
     write_instance,
 )
-from clippon.net_helper import spawn_command
+from clippon.net_helper import orphan_namespaces, spawn_command
 from clippon import net_helper
 from clippon.pair import Pairing
 from clippon.ports import allocate_host, docker_user_checks, lan_from_ip_json, nft_table
-from clippon.proc import env_has_pair, shell_status
+from clippon.proc import all_pids, env_has_pair, env_value, shell_status
 from clippon.protocol import dumps, loads
 from clippon.sunshine import fatal_lines, managed_env, managed_tray, tray_plan
 from clippon.units import system_unit, user_unit
@@ -158,6 +158,32 @@ class TrayTests(unittest.TestCase):
         self.assertEqual(managed_tray("auto"), "disabled")
         self.assertEqual(managed_tray("disabled"), "disabled")
         self.assertEqual(managed_tray("enabled"), "enabled")
+
+
+    def test_env_value_reads_a_single_variable(self) -> None:
+        blob = b"A=1\0PIPEWIRE_RUNTIME_DIR=/run/user/1/cage-audio-desk\0B=2\0"
+        self.assertEqual(
+            env_value(blob, "PIPEWIRE_RUNTIME_DIR"), "/run/user/1/cage-audio-desk"
+        )
+        self.assertIsNone(env_value(blob, "CLIPPON_SEAT"))
+
+
+    def test_all_pids_sees_this_process(self) -> None:
+        self.assertIn(os.getpid(), all_pids())
+
+
+class ReclaimTests(unittest.TestCase):
+    def test_orphan_namespaces_are_the_ones_we_would_have_made(self) -> None:
+        existing = [
+            "clippon-alpha",   # still recorded
+            "clippon-gone",    # recorded nowhere
+            "clippon-Bad",     # not a name we hand out
+            "clippon-",        # same
+            "docker0",         # not ours
+        ]
+        self.assertEqual(
+            orphan_namespaces(existing, {"clippon-alpha"}), ["clippon-gone"]
+        )
 
 
 class SeatTests(unittest.TestCase):

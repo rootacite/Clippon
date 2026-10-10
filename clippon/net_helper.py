@@ -18,8 +18,9 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from clippon.instance import validate_name
+from clippon.instance import seat_name, validate_name
 from clippon.log import error, note, warn, setup_logging
+from clippon.proc import all_pids, process_env_value
 from clippon.ports import (
     BRIDGE,
     BRIDGE_IP,
@@ -173,6 +174,109 @@ def spawn_command(ns_path: str, user: str, gid: int, argv: list[str]) -> list[st
     return ["nsenter", "-F", f"--net={ns_path}", "--", *host_command(user, gid, argv)]
 
 
+def orphan_namespaces(existing: list[str], live: set[str]) -> list[str]:
+    """Namespace names that have no live instance behind them.
+
+    Only names this helper would have created ("clippon-<valid name>") count,
+    and *live* holds the namespaces of the instances still recorded.
+    """
+    found = []
+    for ns in existing:
+        if ns in live or not ns.startswith("clippon-"):
+            continue
+        try:
+            validate_name(ns[len("clippon-") :])
+        except ValueError:
+            continue
+        found.append(ns)
+    return found
+
+
+def kill_instance_leftovers(instance: str) -> int:
+    """Stop what an instance left running when its clippon went away.
+
+    cage, the streamed app and anything they spawned carry CLIPPON_SEAT; a
+    plain command like `sleep infinity` outlives its cage, so the seat is what
+    catches them. The private audio daemons carry the instance's
+    PIPEWIRE_RUNTIME_DIR instead. Both markers are matched, the same way
+    leftover_instances detects them. Returns how many were signalled.
+    """
+    seat = seat_name(instance)
+    audio_suffix = f"/cage-audio-{instance}"
+    stopped = 0
+    for pid in all_pids():
+        on_seat = process_env_value(pid, "CLIPPON_SEAT") == seat
+        runtime = process_env_value(pid, "PIPEWIRE_RUNTIME_DIR")
+        on_audio = runtime is not None and runtime.endswith(audio_suffix)
+        if on_seat or on_audio:
+            stopped += _kill_group(pid)
+    if stopped:
+        note("net", "stopped %s leftover process(es) of %s", stopped, instance)
+    return stopped
+
+
+def leftover_instances(live: set[str]) -> dict[str, int]:
+    """Processes that belong to an instance no live record covers.
+
+    Two markers name an instance: CLIPPON_SEAT for cage, the streamed app and
+    anything they spawn, and the private PIPEWIRE_RUNTIME_DIR folder for the
+    audio daemons. *live* holds the instances still recorded.
+    """
+    found: dict[str, int] = {}
+    for pid in all_pids():
+        names: set[str] = set()
+        seat = process_env_value(pid, "CLIPPON_SEAT")
+        if seat is not None and seat.startswith("seat-cage-"):
+            names.add(seat[len("seat-cage-") :])
+        runtime = process_env_value(pid, "PIPEWIRE_RUNTIME_DIR")
+        if runtime is not None:
+            folder = runtime.rsplit("/", 1)[-1]
+            if folder.startswith("cage-audio-"):
+                names.add(folder[len("cage-audio-") :])
+        for name in names:
+            if not name or name in live:
+                continue
+            found[name] = found.get(name, 0) + 1
+    return found
+
+
+def _kill_group(pid: int) -> int:
+    """SIGKILL a process and the session it leads. 1 when something was sent."""
+    try:
+        os.killpg(pid, signal.SIGKILL)
+        return 1
+    except OSError:
+        pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+        return 1
+    except OSError:
+        return 0
+
+
+def _netns_names() -> list[str]:
+    """Every network namespace on the host, by name."""
+    proc = subprocess.run(
+        ["ip", "-j", "netns", "list"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return []
+    try:
+        entries = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(entries, list):
+        return []
+    return [
+        item["name"]
+        for item in entries
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    ]
+
+
 def alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -194,10 +298,15 @@ def _signal_and_wait(pid: int) -> None:
         if not alive(pid):
             return
         _time.sleep(0.1)
+    # It ignored SIGTERM. Take its whole session down: a clippon that had to be
+    # force-killed still holds cage and the streamed app in its process group.
     try:
-        os.kill(pid, _signal.SIGKILL)
+        os.killpg(pid, _signal.SIGKILL)
     except OSError:
-        pass
+        try:
+            os.kill(pid, _signal.SIGKILL)
+        except OSError:
+            pass
 
 
 class Helper:
@@ -226,8 +335,34 @@ class Helper:
                 note("net", "ignoring unreadable state %s: %s", STATE_PATH, exc)
         return cls(owner, state)
 
-    def serve(self) -> None:
+    def _reclaim(self) -> None:
+        """Drop what earlier runs left behind.
+
+        Nothing needs reclaiming while a run is healthy: instances outlive
+        clippond on purpose, and their namespaces belong to them. Leftovers come
+        from a namespace whose instance record never reached the state file, or
+        from an instance whose clippon process died while the helper was away.
+        """
+        self._refresh()
+        for name, rec in list(self.state.instances.items()):
+            if rec.exited:
+                note("net", "reclaiming %s: its clippon process is gone", name)
+                self.destroy(name)
+        live = {netns_name(name) for name in self.state.instances}
+        for ns in orphan_namespaces(_netns_names(), live):
+            name = ns[len("clippon-") :]
+            note("net", "removing leftover namespace %s", ns)
+            self._destroy_links(name)
+            kill_instance_leftovers(name)
+        # Standalone single-instance runs use the shared seat and the unnamed
+        # audio folder, so they never show up here.
+        for name, count in sorted(leftover_instances(set(self.state.instances)).items()):
+            note("net", "removing %s leftover process(es) of %s", count, name)
+            kill_instance_leftovers(name)
         self._prepare_host()
+
+    def serve(self) -> None:
+        self._reclaim()
         path = HELPER_SOCK
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
@@ -360,6 +495,9 @@ class Helper:
         if rec is not None and rec.sun_pid is not None and alive(rec.sun_pid):
             # Sunshine outlives a stopped clippon unless it is signalled too.
             _signal_and_wait(rec.sun_pid)
+        # cage, the streamed app and the private audio daemons are not in this
+        # process tree, so nothing else would stop them.
+        kill_instance_leftovers(name)
         self._destroy_links(name)
         self.state.instances.pop(name, None)
         self._save()
@@ -403,6 +541,9 @@ class Helper:
                 argv = [sunshine_spawn_path(), *argv[1:]]
             cmd = spawn_command(str(ns_path), self.owner.user, self.owner.gid, argv)
         else:
+            # A previous run of this instance may have left its app or audio
+            # daemons behind; this one is about to take the same seat.
+            kill_instance_leftovers(name)
             cmd = host_command(self.owner.user, self.owner.gid, argv)
         try:
             proc = subprocess.Popen(

@@ -96,6 +96,29 @@ cage 627654（beta） 持有: event26, event27, event28
 
 顺带发现：地址垫片 `libsunshine_addr.so` 一直没生效（同样因为 file caps 让 `LD_PRELOAD` 被忽略），现在也不再预加载进 Sunshine —— `LocalIP` 与 `sessionUrl0` 由网关改写。
 
+### 八、实例退出的清理
+
+`clippond` 被 `SIGKILL` 时，实例进程按设计继续跑（它们本来就比守护进程活得久），但没有任何东西回收它们的 netns；更常见的是另一类残留：cage 死了、应用还活着。实测 `~/Downloads` 那批视频之前，alpha 的 `sleep infinity` 应用就在 6 次重启后各留下一个（`ppid=1`，带着旧的 `PIPEWIRE_RUNTIME_DIR`），另外 6 个 `sleep` 是更早的实例留下的。
+
+现在清理集中在 helper 侧，三个入口：
+
+- **helper 启动时对账** `_reclaim()`：记录里 `exited` 的实例直接 `destroy`；磁盘上存在但没有记录的 `clippon-*` netns 删掉；再用 `leftover_instances()` 扫一遍 `/proc`，把"座位或音频目录指向某个没有记录的实例"的进程全部收掉。
+- **`destroy` 时清扫** `kill_instance_leftovers()`：任何进程只要 `CLIPPON_SEAT` 等于该实例的座位、或 `PIPEWIRE_RUNTIME_DIR` 以 `/cage-audio-<实例>` 结尾，就整组 `SIGKILL`。这一条同时覆盖正常 `clipponctl stop`（应用可能比 cage 活得久）和守护进程被 `SIGKILL` 之后的情况。
+- **实例启动前清扫**：helper 在 spawn 该实例的 clippon 之前先跑一次同样的清扫，保证新的运行不会继承上一次残留的应用。
+- 另外 `_signal_and_wait` 的超时分支改成对进程组 `SIGKILL`：clippon 忽略 `SIGTERM` 时才走到这里，此时它仍然握着 cage 与应用的进程组。
+
+座位标记（`CLIPPON_SEAT`）只能覆盖改动之后的进程；更早的残留只有音频目录那个标记，所以两套标记都要匹配 —— 这正是第一版实现漏掉的地方（探测用两个标记、清扫只匹配守护进程名，日志报"removed 6"但一个都没杀掉）。
+
+验证（2026-10-10 21:44）：
+
+```text
+kill -9 alpha 的 clippon 之后:  sunshine=2  netns=clippon-alpha, clippon-beta
+helper 重启之后:              sunshine=1  netns=clippon-beta
+alpha 残留: 座位进程 0 个，音频标记进程 0 个
+```
+
+历史残留也在同一次对账里清掉：日志 `removing 6 leftover process(es) of alpha` → `stopped 6 leftover process(es) of alpha`，之后 `beta` 完全未受影响。
+
 ## 当前状态
 
 - `clippon-net` 与 `clippond` 都在运行。

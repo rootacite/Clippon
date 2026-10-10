@@ -101,10 +101,6 @@ WAYLAND_DISPLAY=wayland-0 grim /tmp/after.png
 
 `clippon-net` 会在 `DOCKER-USER` 存在时插入放行 `10.200.0.0/24` 的规则。Docker 现在是 `inactive`，这段没跑过。
 
-### SIGKILL 之后会留下网络命名空间
-
-销毁 netns 的只有 `clippond`。它被 `SIGKILL` 时，实例进程继续活着，netns 没人回收。重新拉起 `clippond` 之后 `_reap` 会清掉已经退出的实例；还在运行的会保留，直到手工 `clipponctl stop`。
-
 ### 实例进程留在 `clippon-net` 的 cgroup 里
 
 `clippon-net.service` 用 `KillMode=process`，重启服务不会杀掉实例。代价是 systemd 记为 `Found left-over process ... in control group`，这些进程的资源限制和日志归属挂在 helper 的 unit 上。要更干净的话得给它们一个独立的 scope。
