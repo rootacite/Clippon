@@ -27,6 +27,8 @@ uinput 设备和 `/dev/input` 都是内核全局对象，不是 per-netns 的，
 
 udev 规则只能按设备名（`libvirtualhid*`）打 `ID_SEAT`，区分不出设备属于哪个实例。所以两个实例都在跑时，两边的 cage 会各自打开全部设备。同一时刻只有一路在推流，实际影响是另一侧的 cage 白拿一份事件。要彻底分开得让每个实例有独立的 seat 名，那需要让 udev 知道设备归属，目前做不到。
 
+另一条消除它的路是让实例进程只在会话期存在（同一时刻只驻留一个实例），已核实可行但暂不实施，见 `docs/DESIGN-ondemand-backend.md`。
+
 ### 光标渲染是正常的
 
 之前误判过一次。cage 用 `wlr_scene_output_commit` 渲染，headless 输出上画得出光标（用 `grim` 截图确认过）。所以"看不到指针"不是渲染问题。
