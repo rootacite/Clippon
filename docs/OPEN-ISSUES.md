@@ -47,11 +47,7 @@ WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 grim /tmp/after.png
 
 ## 配对
 
-### 真实 Moonlight 的整条配对还要再走一遍
-
-网关侧的配对状态机已经接上（`getservercert`、`clientchallenge`、`serverchallengeresp`、`clientpairingsecret`、`pairchallenge`），PIN 从 `clipponctl pin NNNN` 进来，配对成功的客户端证书会写进 `state/gateway/clients.json` 并在重启后读回。
-
-没做的：配对一次真实客户端，确认重启网关后不用重新配对。
+配对本身已经走通（见 `docs/WORKLOG.md` 第五节）。留在这里的是握手层的那一条限制。
 
 ### 网关没法校验 Moonlight 的客户端证书
 
@@ -61,9 +57,9 @@ WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 grim /tmp/after.png
 
 要真正恢复校验，得换掉 `ssl` 这一层：自己用 OpenSSL 的 `SSL_CTX_set_verify` 接一个永真回调再在应用层比对指纹，或者把 47984 交给一个能这么做的独立进程。
 
-### 已配对的客户端证书需要重配一次
+### 配对状态是全局的，认不出具体是哪台设备
 
-`state/gateway/clients.json` 里现在是从宿主机旧 Sunshine（`~/.config/sunshine/sunshine_state.json`）导入的 9 张证书。如果 Moonlight 那边不是其中任何一张，就要重新配一次——网关会自己收下 PIN，不需要后端网页。
+`PairStatus` 由 `bool(clients.all())` 决定，只要 `clients.json` 里有一条记录，任何 HTTPS 客户端都会看到 `PairStatus=1`。这是上一条限制的直接后果：既然握手层拿不到对端证书，就没法按客户端区分。当前 `clients.json` 里 10 张证书中 9 张来自宿主机旧 Sunshine，第 10 张是单元测试的 `testsim`。
 
 ## 网络
 
