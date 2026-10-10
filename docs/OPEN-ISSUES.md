@@ -102,6 +102,23 @@ WAYLAND_DISPLAY=wayland-0 grim /tmp/after.png
 
 22:14 这次弹窗是为了把上面第 3 步抓住：`nmcli device set vn-wprobe managed yes` 让 NM 写下同一条 `Wired connection 1`。探测用的网卡和这条连接配置已经删掉。点 Cancel 即可，没有要保存的密码。
 
+## 网关
+
+### 客户端中途断开时，网关会打一整段堆栈
+
+客户端读完响应直接 RST 掉连接时，网关在读下一个请求行抛异常，`socketserver` 把线程里的异常整段打进日志。2026-10-10 22:25:04 那次来自 `192.168.4.3`，当时正在用 Moonlight 打开 alpha：
+
+```text
+Exception occurred during processing of request from ('192.168.4.3', 34892)
+  File "clippon/front.py", line 455, in readinto
+    data = self._connection.recv(len(view))
+OpenSSL.SSL.SysCallError: (104, 'ECONNRESET')
+```
+
+进程不受影响，别的请求照常处理。影响只在日志：这一段会把有用的行挤掉，而且客户端每次提前断开都会再来一遍。`_TlsStream.readinto` 里把 `openssl.SysCallError` 与 `OSError` 当成 EOF 返回 0 就能消掉 —— 连接已经没人要了，读出来就是结束。
+
+已记录，暂不处理（2026-10-10 决定）。
+
 ## 会话
 
 ### 客户端退出后，后端会一直报告 BUSY

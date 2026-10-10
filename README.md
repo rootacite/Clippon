@@ -6,27 +6,28 @@
 <h1 align="center">Clippon</h1>
 
 <p align="center">
-  <strong>One host, many sessions</strong><br/>
-  Run several programs side by side on a single machine and let Moonlight see
-  them as several Applications of one GameStream host.
+  <strong>Off-screen, and out of each other's way</strong><br/>
+  Run several programs side by side on one machine, each on a screen of its own
+  with its own keyboard, mouse and sound, while the desktop you are sitting at
+  stays untouched. Moonlight sees all of them as Applications of a single host.
 </p>
 
 <p align="center">
-  Arch Linux · headless cage compositor · one Sunshine per session · network namespaces · userspace gateway
+  Arch Linux · one headless cage compositor and Sunshine per session · private network, input and audio · userspace GameStream gateway
 </p>
 
 ---
 
 ## What this is
 
-Clippon turns a normal Linux program into something Moonlight can open. It runs the program inside a headless [cage](https://github.com/cage-kiosk/cage) compositor and starts a [Sunshine](https://github.com/LizardByte/Sunshine) backend against that compositor's Wayland socket, so the program's window, its audio and the input coming back from the client all behave as if the machine were a GameStream host running that one application.
+Clippon turns a normal Linux program into something Moonlight can open. It runs the program inside a headless [cage](https://github.com/cage-kiosk/cage) compositor and starts a [Sunshine](https://github.com/LizardByte/Sunshine) backend against that compositor's Wayland socket, so the program's window, its audio and the input coming back from the client all behave as if the machine were a GameStream host running that one application. The rendering really happens in that compositor: the program draws into a display of its own, which exists only for the stream. The desktop session running on the machine is not involved in it, and its own windows stay where they are.
 
 The reason the project exists is that a Sunshine host is a single point of contention. Sunshine binds a fixed set of GameStream ports — 47989 for the plain HTTP control plane, 47984 for HTTPS, 47990 for the web UI, and a handful of stream ports — so a second Sunshine on the same machine cannot start, and the first one only ever has one session running at a time (`/launch` refuses with `An app is already running on this host`). Many people work around this by owning several machines, or by serializing their sessions on one machine.
 
 Clippon keeps one machine and gives each session its own everything:
 
 - **Its own network stack.** Every session lives in its own network namespace with its own address, so several Sunshine backends can listen on the same ports without colliding. A root helper owns the namespaces, the bridge between them and the DNAT that maps the host's stream ports onto whichever session is being streamed.
-- **Its own display and audio.** Every session has a private cage compositor, a private PipeWire/pipewire-pulse/WirePlumber stack going to a sink that only that session can see, and a private set of virtual input devices.
+- **Its own screen, input and sound.** Every session has a private cage compositor, its own virtual keyboard and mice, and a private PipeWire/pipewire-pulse/WirePlumber stack whose sink only that session's Sunshine can see. Two clients can therefore stream two different programs at the same time — one playing a game, the other watching a video — and each client hears only its own program, while the machine's desktop keeps its windows, its keyboard, its mouse and its speakers to itself.
 - **One shared GameStream front.** A userspace gateway running in the host namespace answers 47984 and 47989 itself. It merges the backends' application lists, so Moonlight sees one host with one Application per session, and it routes `/launch`, `/resume`, `/cancel` and the stream ports to the right backend. Pairing is implemented in the gateway too, so a client that has paired with the host stays paired no matter which session it opens.
 
 The foreground mode of the original shell script is still there: `clippon -- <command>` runs one session on the host network with no daemon, no namespaces and no gateway.
