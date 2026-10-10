@@ -89,13 +89,18 @@ WAYLAND_DISPLAY=wayland-0 grim /tmp/after.png
 
 已记录，暂不处理（2026-10-10 决定）。影响：unit 上没有设任何 `CPUQuota`/`MemoryMax`/`TasksMax`，所以现在没有实际后果；一旦给 unit 加限制，限制会作用在所有实例的总和上。要彻底干净得让每个实例跑在自己的 transient scope 里，helper 的 spawn 与 pid 跟踪都要改成从 systemd 取 `MainPID`。
 
-### 重启 clippond 会弹 KDE 钱包解锁框
+### 新建实例 veth 时，NetworkManager 会弹 KDE 钱包
 
-`systemctl --user restart clippond` 会让 KDE 那边的组件去请求会话 secret service，`ksecretd` 因为没有父窗口，直接把 `kdewallet` 的解锁对话框丢到桌面上。
+对话框原文是 “KDE has requested to open the wallet 'kdewallet'.”。它不是 `clippond` 重启引起的。重启这个用户单元不会创建网卡，钱包调用一次都没有。钱包已经开着时，后面的请求也不再弹窗，所以 21:27 和 21:54 那几次重启桌面上什么都没有。
 
-触发条件与"重装"无关，只要这个用户单元重启就会弹。2026-10-10 实测：手工 `systemctl --user restart clippond` 三次，三次都弹；`install-daemon.py` 那条"只在 unit 文本真的变了才重启"只覆盖了重装这条路径。
+真正的链条：
 
-真正的机制还没查清楚：为什么重启一个 python 服务会让 KDE 去解锁 `kdewallet`。想彻底不弹，目前的办法只有把 `kdewallet` 设成空密码。
+1. helper 在宿主机上先 `ip link add vb-<实例> type veth peer name vn-<实例>`，再把 `vn-<实例>` 送进 netns。
+2. 若 NetworkManager 在设备被送走之前把它当成要管理的网卡，就会写一条 `Wired connection 1` 并自动激活。今天的弹出和这一行在同一秒：`settings: (vn-beta): created default wired connection 'Wired connection 1'`（19:02:20、19:19:49、19:25:56、19:42:32、19:43:46、19:46:56、20:03:19、21:00:42）。唯一对不齐的是 19:45:41 那次 `ksecretd` 日志：19:45:14 写过同一条连接，当时没有钱包日志，27 秒后才补上，中间没有第二次写连接。被写配置的一直是 `vn-beta`：它比 `vn-alpha` 在宿主机上多停留一会儿，日志里有 `error setting IPv4 forwarding`。22:12 的 `walletprobe` 被立刻送进 netns，NM 只记了 `new Veth device`，没有写连接，也没有钱包调用。
+3. `kded6` 里已加载的 `networkmanagement` 模块（`plasma-nm` 6.7.5-1，`/usr/lib/qt6/plugins/kf6/kded/networkmanagement.so`）跟着去开钱包。22:14:43 的总线记录：`kded6`（pid 553067）对 `org.kde.kwalletd6` 调用 `networkWallet`，再 `open("kdewallet", wId=0, "Network Management")`。
+4. `kwalletd6` 6.30.0 把这个请求转成对 `ksecretd` 的 `Unlock` 加 `Prompt("")`。窗口 id 是 0，应用名没有传下去，所以 `ksecretd` 打出 `Using kwallet without parent window!`，对话框落到桌面上。新连接没有对应的密码项，解锁之后 `kwalletd6` 再打 `Item not found`。
+
+22:14 这次弹窗是为了把上面第 3 步抓住：`nmcli device set vn-wprobe managed yes` 让 NM 写下同一条 `Wired connection 1`。探测用的网卡和这条连接配置已经删掉。点 Cancel 即可，没有要保存的密码。
 
 ## 会话
 

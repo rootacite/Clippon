@@ -153,12 +153,46 @@ HTTP  /applist                    403
 
 `clients.json` 恢复成原来的 10 条之后，未配对客户端再次被拒。47990 后面仍是 Sunshine 自己的 Web UI，有它自己的登录。
 
+### 十一、KDE 钱包弹窗的来源
+
+先前记成“重启 `clippond` 就会弹”。对照全天日志，这个说法不成立：钱包那一行和 `settings: (vn-beta): created default wired connection 'Wired connection 1'` 成对出现，和 `clippond` 的启停对不上。22:08 在钱包已经打开的前提下重启 `clippond`、单独起一套会抢 `org.pulseaudio.Server` 的 pipewire，以及 22:12 起了一个完整的 `walletprobe` 实例，总线上看不到任何发往 `kwalletd6` / `ksecretd` 的调用。
+
+22:14 把一条临时 veth 交给 NetworkManager 管理，复现了同一条连接配置，对话框随之出现。调用者是 `kded6` 的 `networkmanagement` 模块，应用名参数是 `Network Management`，窗口 id 是 0；`kwalletd6` 再用空窗口向 `ksecretd` 要解锁。细节和当天的时间戳在 `docs/OPEN-ISSUES.md`。
+
+### 十二、封面改成实例的实时截图
+
+Moonlight 要封面时请求 `/appasset?appid=<外部 id>&AssetType=2&AssetIdx=0`（`app/backend/nvhttp.cpp:392` 的 `getBoxArt`），读到图之后按固定的 200x267 画（`app/gui/AppView.qml:105-110` 把宽高都写死），所以 16:9 的截图原样返回会被拉成竖条。之前 `/appasset` 直接转发给后端，而我们的应用条目没有图片，Sunshine 就回它的占位图。
+
+现在 `clippon/artwork.py` 接管这个端点：
+
+- 用 appid 反查实例（`Front._route_for`，与 `/launch` 共用一张表），再找这个实例的 cage 显示：`ss -xlp` 里每个 `wayland-N` socket 的持有 pid，读 `/proc/<pid>/environ` 的 `CLIPPON_SEAT` 是否等于 `seat-cage-<实例>`，并从同一份 environ 取 `XDG_RUNTIME_DIR`。按座位标记认领而不是按 socket 名，因为 socket 名每次开机都重新分配，多实例并行时只有座位能区分。
+- `grim` 截该显示，Pillow 合成 400x534 卡片（Moonlight 显示尺寸的两倍）：整幅画面等比居中放前面，同一张图放大铺满卡片、高斯模糊后作背景。画面完整且不变形，卡片也不留黑边。
+- grim 用 `-t jpeg -q 92`：1440p 一帧 PNG 编码要 1.3s，JPEG 0.3s，而卡片反正要重新采样。
+- 截图按实例缓存 20 秒，每个实例同时只跑一次 grim；`AssetType` 不是 2、实例查不到、显示找不到或 grim 失败时返回 None，请求按原路转发给后端，拿到占位图而不是报错。
+- `grim` 与 `python-pillow` 加进了 `install.py` 和 `install-daemon.py` 的依赖清单，`pyproject.toml` 也声明了 pillow。
+
+验证（2026-10-10 22:21，用 `clients.json` 里临时登记的网关客户端证书请求，测完已还原成原来的 10 条）：
+
+```text
+/applist                       beta 99903777, alpha 462510448
+/appasset(appid=462510448)     200 image/png 400x534 153561 B（alpha 的《大清疯人院》画面）
+/appasset(appid=99903777)      200 image/png 400x534 178074 B（beta 的《二次元顶级战犯》画面，与 alpha 不同）
+未配对客户端                    403
+未知 appid                     404 no backend for this request
+AssetType=0                    200，仍由后端回答（Sunshine 自己的 600x800 占位图）
+首次请求                        0.58s（grim + compose）
+20 秒内再请求                   0.007s（缓存）
+```
+
+局限：Moonlight 自己会把封面缓存到磁盘（`app/backend/boxartmanager.cpp`，按主机 uuid 与 appId 存 PNG），客户端要清掉那份缓存才会重新请求；截图是请求那一刻的画面，应用停掉之后卡片保持最后一次的结果。
+
 ## 当前状态
 
 - `clippon-net` 与 `clippond` 都在运行。
 - `alpha`（10.200.0.2）与 `beta`（10.200.0.3）各自在自己的 netns 里，端口互不冲突。
 - 网关在另一台机器的 Moonlight 上表现为一台主机，应用列表里是 `alpha` 和 `beta`，两个都能打开，指针和键盘正常。
-- 单元测试 35 项通过。
+- 封面是这个实例的实时截图（见十二）；客户端把封面缓存到磁盘，旧客户端要清一次缓存。
+- 单元测试 57 项通过。
 
 ## 目录
 

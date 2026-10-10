@@ -3,10 +3,10 @@ name = "clippon"
 version = "0.1.0"
 description = "Run a program in a headless cage session and stream it with Sunshine."
 requires-python = ">=3.11"
-# The gateway's GameStream pairing speaks AES-128-ECB and RSA, neither of
-# which is in the standard library. install-daemon.py pulls in
-# python-cryptography from pacman; this keeps a plain pip install honest.
-dependencies = ["cryptography>=41"]
+# The gateway's GameStream pairing speaks AES-128-ECB and RSA, and its box art
+# is composed with Pillow; neither is in the standard library. install-daemon.py
+# pulls both from pacman, this keeps a plain pip install honest.
+dependencies = ["cryptography>=41", "pillow>=10"]
 
 [project.scripts]
 clippon = "clippon.cli:main"

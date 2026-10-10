@@ -31,6 +31,7 @@ from clippon.log import error, note, setup_logging, warn
 # seat shim and (via base-devel) an AUR package.
 OFFICIAL_PACKAGES = (
     "cage",
+    "grim",
     "wlr-randr",
     "pipewire",
     "pipewire-pulse",
@@ -43,6 +44,7 @@ OFFICIAL_PACKAGES = (
     "python",
     "python-cryptography",
     "python-pyopenssl",
+    "python-pillow",
     "git",
     "base-devel",
 )
@@ -300,7 +302,15 @@ def install_launcher(dry_run: bool) -> None:
 
 
 def summary() -> None:
-    for name in ("cage", "sunshine", "wlr-randr", "pipewire", "pipewire-pulse", "wireplumber"):
+    for name in (
+        "cage",
+        "grim",
+        "sunshine",
+        "wlr-randr",
+        "pipewire",
+        "pipewire-pulse",
+        "wireplumber",
+    ):
         found = shutil.which(name)
         if found:
             note("inst", "%-16s %s", name, found)

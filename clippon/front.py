@@ -2,9 +2,10 @@
 
 47989 and 47984 are the GameStream control plane. serverinfo is answered
 here, with LocalIP set to the address the client dialed. applist, launch,
-resume, cancel, appasset and pair are sent on to a backend over its veth
-address. launch also points the stream-port DNAT at that backend and rewrites
-sessionUrl0. 47990 is a raw TCP proxy onto the exposed instance's web UI.
+resume, cancel and pair are sent on to a backend over its veth address, and
+box art is a screenshot of the instance the app belongs to. launch also points
+the stream-port DNAT at that backend and rewrites sessionUrl0. 47990 is a raw
+TCP proxy onto the exposed instance's web UI.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import io
 import select
 import socket
 import ssl
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +24,7 @@ import uuid as uuidlib
 
 from OpenSSL import SSL as openssl
 
+from clippon.artwork import LiveArtwork
 from clippon.clients import PairedClients, openssl_fingerprint
 from clippon.config import ClipponError
 from clippon.gateway import (
@@ -55,6 +58,7 @@ class Front:
             identity.server_key.read_text(encoding="utf-8"),
             on_paired=self.clients.add,
         )
+        self.artwork = LiveArtwork()
         self._routes: dict[int, tuple[str, str]] = {}
         self._lock = threading.Lock()
 
@@ -102,6 +106,11 @@ class Front:
         if kind != "forward":
             _write(handler, 404, _status_page(404, "Not found").encode())
             return
+        if path == "/appasset":
+            picture = self._live_box_art(target)
+            if picture is not None:
+                _write(handler, 200, picture, "image/png")
+                return
         try:
             status, body = self._forward(target, local_ip)
         except (OSError, ClipponError, ValueError) as exc:
@@ -176,6 +185,36 @@ class Front:
             self._routes = table
         return merged
 
+    def _live_box_art(self, target: str) -> bytes | None:
+        """The instance's own screen, for the app the client asked about.
+
+        None means "not ours to answer", and the request goes on to the backend.
+        """
+        external = box_art_request(target)
+        if external is None:
+            return None
+        found = self._route_for(external)
+        if found is None:
+            return None
+        name, _internal = found
+        try:
+            return self.artwork.box_art(name)
+        except (OSError, subprocess.SubprocessError) as exc:
+            note("gate", "box art for %s failed: %s", name, exc)
+            return None
+
+    def _route_for(self, external: int) -> tuple[str, str] | None:
+        """(instance, internal app id) for an external app id Moonlight stored."""
+        with self._lock:
+            found = self._routes.get(external)
+        if found is None:
+            # A client can remember ids across a gateway restart, so rebuild the
+            # table from the backends before giving up on the request.
+            self._applist()
+            with self._lock:
+                found = self._routes.get(external)
+        return found
+
     def _backend_for(self, target: str) -> tuple[str, str, str | None] | None:
         path = target.split("?", 1)[0]
         live = dict(self._live())
@@ -184,12 +223,7 @@ class Front:
             external = _query_value(target, "appid")
             if external is None or not external.isdigit():
                 return None
-            with self._lock:
-                found = self._routes.get(int(external))
-            if found is None:
-                self._applist()
-                with self._lock:
-                    found = self._routes.get(int(external))
+            found = self._route_for(int(external))
             if found is None:
                 return None
             name, internal = found
@@ -301,10 +335,15 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
 
-def _write(handler: BaseHTTPRequestHandler, status: int, body: bytes) -> None:
+def _write(
+    handler: BaseHTTPRequestHandler,
+    status: int,
+    body: bytes,
+    content_type: str = "application/xml",
+) -> None:
     handler.close_connection = True
     handler.send_response(status)
-    handler.send_header("Content-Type", "application/xml")
+    handler.send_header("Content-Type", content_type)
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Connection", "close")
     handler.end_headers()
@@ -489,6 +528,21 @@ def _status_page(code: int, message: str) -> str:
         '<?xml version="1.0" encoding="utf-8"?>'
         f'<root status_code="{code}" status_message="{safe}"></root>'
     )
+
+
+def box_art_request(target: str) -> int | None:
+    """The external app id when *target* asks for box art, else None.
+
+    Moonlight asks for AssetType=2 only (nvhttp.cpp getBoxArt); other asset
+    types stay with the backend, which is the only place that has them.
+    """
+    asset = _query_value(target, "AssetType")
+    if asset not in (None, "2"):
+        return None
+    external = _query_value(target, "appid")
+    if external is None or not external.isdigit():
+        return None
+    return int(external)
 
 
 def _query_value(target: str, key: str) -> str | None:

@@ -633,6 +633,132 @@ class PairedClientTests(unittest.TestCase):
         self.assertEqual(second.all(), [pem])
 
 
+SS_SAMPLE = """\
+u_str LISTEN 0      128     /run/user/1000/wayland-proxy-612646 4935749      * 0    users:(("firefox",pid=612646,fd=12))
+u_str LISTEN 0      128         /run/user/1000/wayland-2 5062167      * 0    users:(("cage",pid=627654,fd=29),("cage",pid=627654,fd=28))
+u_str LISTEN 0      128         /run/user/1000/wayland-0 5111993      * 0    users:(("cage",pid=630532,fd=29))
+u_str LISTEN 0      128         /run/user/1000/wayland-1 4474356      * 0    users:(("kwin_wayland_wr",pid=552957,fd=7))
+u_str LISTEN 0      1              @/tmp/.X11-unix/X1 4474358      * 0    users:(("Xwayland",pid=553013,fd=9))
+"""
+
+
+class ArtworkTests(unittest.TestCase):
+    """Box art is a screenshot of the instance, composed into Moonlight's card."""
+
+    def test_socket_lines_are_read_for_wayland_names_and_pids(self) -> None:
+        from clippon.artwork import parse_sockets
+
+        found = parse_sockets(SS_SAMPLE)
+        self.assertEqual(
+            [(Path(path).name, pids) for path, pids in found],
+            [("wayland-2", [627654]), ("wayland-0", [630532]), ("wayland-1", [552957])],
+        )
+
+    def test_the_seat_tag_names_the_instance_behind_a_socket(self) -> None:
+        from clippon import artwork
+
+        def env(pid: int, key: str) -> str | None:
+            table = {
+                (630532, "CLIPPON_SEAT"): "seat-cage-alpha",
+                (630532, "XDG_RUNTIME_DIR"): "/run/user/1000",
+                (627654, "CLIPPON_SEAT"): "seat-cage-beta",
+                (627654, "XDG_RUNTIME_DIR"): "/run/user/1000",
+                (552957, "CLIPPON_SEAT"): None,
+            }
+            return table.get((pid, key))
+
+        with mock.patch.object(artwork, "socket_table", return_value=SS_SAMPLE), mock.patch.object(
+            artwork, "process_env_value", side_effect=env
+        ):
+            self.assertEqual(artwork.display_for("alpha"), ("/run/user/1000", "wayland-0"))
+            self.assertEqual(artwork.display_for("beta"), ("/run/user/1000", "wayland-2"))
+            self.assertIsNone(artwork.display_for("gamma"))
+
+    def test_a_screenshot_is_fitted_into_the_card_without_stretching(self) -> None:
+        from PIL import Image, ImageDraw
+
+        from clippon.artwork import CARD, compose
+
+        shot = Image.new("RGB", (1600, 900), (255, 0, 0))
+        ImageDraw.Draw(shot).rectangle((800, 0, 1599, 899), fill=(0, 0, 255))
+        raw = io.BytesIO()
+        shot.save(raw, "PNG")
+        card = compose(raw.getvalue())
+        self.assertIsNotNone(card)
+        with Image.open(io.BytesIO(card or b"")) as picture:
+            self.assertEqual(picture.size, CARD)
+            row = picture.height // 2
+            left = picture.getpixel((5, row))
+            right = picture.getpixel((CARD[0] - 6, row))
+            corner = picture.getpixel((0, 0))
+        # The whole frame is inside the card, left half red and right half blue.
+        self.assertGreater(left[0], 150)
+        self.assertLess(left[2], 100)
+        self.assertGreater(right[2], 150)
+        self.assertLess(right[0], 100)
+        # The card is filled: no black border where the blurred copy sits.
+        self.assertGreater(sum(corner), 60)
+
+    def test_a_screenshot_is_cached_between_requests(self) -> None:
+        from clippon.artwork import LiveArtwork
+
+        art = LiveArtwork()
+        with mock.patch.object(art, "_capture", return_value=b"png") as capture:
+            self.assertEqual(art.box_art("alpha"), b"png")
+            self.assertEqual(art.box_art("alpha"), b"png")
+        self.assertEqual(capture.call_count, 1)
+
+    def test_a_failed_capture_is_not_cached(self) -> None:
+        from clippon.artwork import LiveArtwork
+
+        art = LiveArtwork()
+        with mock.patch.object(art, "_capture", side_effect=[None, b"png"]) as capture:
+            self.assertIsNone(art.box_art("alpha"))
+            self.assertEqual(art.box_art("alpha"), b"png")
+        self.assertEqual(capture.call_count, 2)
+
+    def test_capture_asks_grim_for_the_instance_display(self) -> None:
+        from clippon.artwork import LiveArtwork
+
+        def fake_run(argv: list[str], **kwargs: object) -> object:
+            Path(argv[-1]).write_bytes(self.small_png())
+            return mock.Mock(returncode=0, stderr=b"")
+
+        art = LiveArtwork()
+        with mock.patch(
+            "clippon.artwork.display_for", return_value=("/run/user/1000", "wayland-0")
+        ), mock.patch("clippon.artwork.subprocess.run", side_effect=fake_run) as run:
+            picture = art.box_art("alpha")
+        self.assertIsNotNone(picture)
+        argv, kwargs = run.call_args
+        self.assertEqual(argv[0][:3], ["grim", "-t", "jpeg"])
+        self.assertEqual(kwargs["env"]["WAYLAND_DISPLAY"], "wayland-0")
+        self.assertEqual(kwargs["env"]["XDG_RUNTIME_DIR"], "/run/user/1000")
+
+    def test_a_missing_display_leaves_the_request_to_the_backend(self) -> None:
+        from clippon.artwork import LiveArtwork
+
+        art = LiveArtwork()
+        with mock.patch("clippon.artwork.display_for", return_value=None):
+            self.assertIsNone(art.box_art("alpha"))
+
+    def small_png(self) -> bytes:
+        from PIL import Image
+
+        raw = io.BytesIO()
+        Image.new("RGB", (320, 180), (10, 200, 30)).save(raw, "PNG")
+        return raw.getvalue()
+
+    def test_only_box_art_requests_are_answered_here(self) -> None:
+        from clippon.front import box_art_request
+
+        self.assertEqual(box_art_request("/appasset?appid=42&AssetType=2&AssetIdx=0"), 42)
+        self.assertIsNone(box_art_request("/appasset?appid=42&AssetType=0&AssetIdx=0"))
+        self.assertIsNone(box_art_request("/appasset?appid=none&AssetType=2"))
+        self.assertIsNone(box_art_request("/appasset?AssetType=2"))
+        self.assertIsNone(box_art_request("/applist"))
+
+
 def json_apps(path: Path) -> dict:
     import json
 

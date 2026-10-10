@@ -125,15 +125,20 @@ def ensure_tools(dry_run: bool) -> None:
         missing.append("iptables")
     if shutil.which("gcc") is None:
         missing.append("gcc")
+    # The gateway screenshots each instance for its box art.
+    if shutil.which("grim") is None:
+        missing.append("grim")
     if not _has_cryptography():
         missing.append("python-cryptography")
     if not _has_module("OpenSSL"):
         missing.append("python-pyopenssl")
+    if not _has_module("PIL"):
+        missing.append("python-pillow")
     for binary in ("ip", "nsenter", "setpriv", "sysctl", "openssl"):
         if shutil.which(binary) is None:
             raise InstallError(f"{binary} is not on PATH")
     if not missing:
-        note("inst", "nft, iptables, gcc, cryptography and pyOpenSSL already present")
+        note("inst", "nft, iptables, gcc, grim, cryptography, pyOpenSSL and Pillow present")
         return
     note("inst", "pacman will install %s", ", ".join(missing))
     run(as_root(["pacman", "-S", "--needed", "--noconfirm", *missing]), dry_run=dry_run)
@@ -319,9 +324,9 @@ def install_units(account: pwd.struct_passwd, dry_run: bool) -> None:
         note("inst", "would systemctl enable --now clippon-net")
         note("inst", "would systemctl --user enable --now clippond")
         return
-    # Restarting a user service makes KDE components hit the session secret
-    # service, which pops the "unlock kdewallet" dialog. Only restart when the
-    # unit text actually changed; enable --now covers first install and start.
+    # Restart only when the unit text changed. enable --now covers the first
+    # install, and a restart drops the gateway for a moment. The KDE wallet
+    # dialog is not caused by this restart; see docs/OPEN-ISSUES.md.
     system_changed = _read_text(SYSTEM_UNIT_PATH) != system
     user_changed = _read_text(user_unit_path) != user
     with tempfile.TemporaryDirectory(prefix="clippon-units-") as temporary:
