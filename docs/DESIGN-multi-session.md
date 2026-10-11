@@ -118,7 +118,7 @@ Moonlight 会把主机身份与 applist 落盘（`app/backend/nvcomputer.cpp:96-
 - **placebo 的残留 BUSY 会拖住占用判定**。我们的应用条目没有 `cmd`，客户端退出后后端会一直报告应用在跑（`docs/OPEN-ISSUES.md` 的"会话"一节）。占用判定要以后端状态收敛，就必须同时解决它：客户端打开 `quitAppAfter`、`/launch` 前先幂等 `/cancel`、或按内核计数器判断存活，任选其一，并补一个手动释放手段（例如 `clipponctl release`）。**落地时选了前两条中的后两条**：`/launch` 先幂等 `/cancel`（实测日志 `alpha still reports an app; cancelling it first`），并加了 `clipponctl release NAME`；按内核计数器判断存活仍然是没做的那条，记在 `docs/OPEN-ISSUES.md`。
 - **端口规划**：每组 22 个端口，避开 Docker 与常用服务；`ports.py` 里往 `DOCKER-USER` 插入规则的逻辑已经有，但这台机器上 Docker 没跑过，属于既有未验证项。组间隔 1000，`47989`、`48989`、`49989`……`1019..65514` 之内共 18 组。
 - **客户端是否总走协商端口**：源码显示是，实际要在第 4 步确认。判据是两路画面各自正确、互不串流；如果发现某一路被送回另一路的端口，说明走到了回退值，需要在宿主上按源地址分流作为兜底。**已确认走协商端口**：两路的 RTSP 分别落在 `base+21` 上，客户端解码正常，没有出现回退端口。
-- **资源预算**：N 路并行 = N 个 VAAPI 编码器 + N 路带宽，实用上限取决于这台机器的 GPU 与网卡。
+- **资源预算**：N 路并行 = N 个 VAAPI 编码器 + N 路带宽，实用上限取决于这台机器的 GPU 与网卡。实测三路（两个局域网客户端加一个本机客户端）同时串三个 Application 未见明显问题；再往上的上限没有量过。
 - **同一台设备要同时看两路**：Moonlight 一个进程一个会话，需要跑两个客户端进程（Linux 上用不同的 `XDG_CONFIG_HOME`，Windows 上用 portable 模式），这一条属于客户端用法，不需要改服务端。
 - **本机客户端**：`output` 钩子的规则数随实例数增长，`127.0.0.1` 仍然不通（netns 回不到宿主 loopback），本机客户端要用局域网地址。
 

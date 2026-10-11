@@ -970,6 +970,17 @@ class ArtworkTests(unittest.TestCase):
         self.assertIsNone(box_art_request("/applist"))
 
 
+class VersionTests(unittest.TestCase):
+    def test_the_package_version_matches_pyproject(self) -> None:
+        import tomllib
+
+        from clippon import __version__
+
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+        self.assertEqual(declared, __version__)
+
+
 def json_apps(path: Path) -> dict:
     import json
 
