@@ -1,8 +1,9 @@
-"""Root helper: one network namespace per clippon instance, and DNAT onto one of them.
+"""Root helper: one network namespace per clippon instance, and its port group.
 
 Cage and Sunshine stay in the host user namespace so they keep the video,
 render and input groups. This process creates the netns, moves a veth into it,
-then nsenter + setpriv drops to the owning user before exec.
+gives the instance a base port of its own, maps that instance's stream ports to
+it, then nsenter + setpriv drops to the owning user before exec.
 """
 
 from __future__ import annotations
@@ -22,10 +23,13 @@ from clippon.instance import seat_name, validate_name
 from clippon.log import error, note, warn, setup_logging
 from clippon.proc import all_pids, process_env_value
 from clippon.ports import (
+    BASE_PORT,
     BRIDGE,
     BRIDGE_IP,
     SUBNET,
+    allocate_base_port,
     allocate_host,
+    base_port_ok,
     docker_user_checks,
     in_subnet,
     lan_from_ip_json,
@@ -90,12 +94,19 @@ class HelperError(Exception):
 @dataclass
 class InstanceRec:
     ip: str
+    port: int = BASE_PORT       # this instance's Sunshine base port, 0 if not assigned yet
     pid: int | None = None      # clippon, on the host network
     sun_pid: int | None = None  # sunshine, inside the instance netns
     exited: bool = False
 
     def to_json(self) -> dict[str, object]:
-        return {"ip": self.ip, "pid": self.pid, "sun_pid": self.sun_pid, "exited": self.exited}
+        return {
+            "ip": self.ip,
+            "port": self.port,
+            "pid": self.pid,
+            "sun_pid": self.sun_pid,
+            "exited": self.exited,
+        }
 
 
 @dataclass
@@ -131,8 +142,10 @@ class NetState:
                 continue
             pid = rec.get("pid")
             sun = rec.get("sun_pid")
+            port = rec.get("port")
             state.instances[name] = InstanceRec(
                 ip=ip,
+                port=port if base_port_ok(port) else 0,
                 pid=pid if isinstance(pid, int) and pid > 0 else None,
                 sun_pid=sun if isinstance(sun, int) and sun > 0 else None,
                 exited=bool(rec.get("exited")),
@@ -416,8 +429,8 @@ class Helper:
         if op == "status":
             return self.status()
         if op == "create":
-            ip = self.create(_name(request))
-            return {"ok": True, "ip": ip}
+            rec = self.create(_name(request))
+            return {"ok": True, "ip": rec.ip, "port": rec.port}
         if op == "destroy":
             self.destroy(_name(request))
             return {"ok": True}
@@ -447,20 +460,23 @@ class Helper:
             "instances": self.state.to_json()["instances"],
         }
 
-    def create(self, name: str) -> str:
+    def create(self, name: str) -> InstanceRec:
         validate_name(name)
         self._prepare_host()
         existing = self.state.instances.get(name)
         if existing is not None and _links_up(name):
-            return existing.ip
+            return existing
+        used_ports = {rec.port for rec in self.state.instances.values() if rec.port}
         if existing is not None:
             note("net", "recreating missing links for %s", name)
             self._destroy_links(name)
             ip = existing.ip
+            port = existing.port or allocate_base_port(used_ports)
         else:
             used = {int(rec.ip.rsplit(".", 1)[1]) for rec in self.state.instances.values()}
             try:
                 octet = allocate_host(used)
+                port = allocate_base_port(used_ports)
             except ValueError as exc:
                 raise HelperError(str(exc)) from exc
             ip = f"10.200.0.{octet}"
@@ -479,15 +495,16 @@ class Helper:
         except HelperError:
             self._destroy_links(name)
             raise
-        self.state.instances[name] = InstanceRec(ip=ip)
+        self.state.instances[name] = InstanceRec(ip=ip, port=port)
         self._save()
-        note("net", "created %s at %s", name, ip)
-        return ip
+        self._apply_nft()
+        note("net", "created %s at %s, ports from %s", name, ip, port)
+        return self.state.instances[name]
 
     def destroy(self, name: str) -> None:
         validate_name(name)
         if self.state.exposed == name:
-            self.expose(None)
+            self.state.exposed = None
         rec = self.state.instances.get(name)
         for proc in self._children.pop(name, []):
             if proc.poll() is None:
@@ -501,20 +518,22 @@ class Helper:
         self._destroy_links(name)
         self.state.instances.pop(name, None)
         self._save()
+        self._apply_nft()
         note("net", "destroyed %s", name)
 
     def expose(self, name: str | None) -> None:
+        """Pick the instance the gateway's web-UI proxy points at.
+
+        Every instance's stream ports stay mapped, so this no longer moves any
+        DNAT rule; it only decides what 47990 reaches.
+        """
         if name is not None:
             validate_name(name)
             if name not in self.state.instances:
                 raise HelperError(f"unknown instance {name}")
-            ip: str | None = self.state.instances[name].ip
-        else:
-            ip = None
         self.state.exposed = name
-        self._apply_nft(ip)
         self._save()
-        note("net", "exposed %s", name or "nothing")
+        note("net", "web UI follows %s", name or "nothing")
 
     def spawn(self, request: dict[str, object], in_netns: bool) -> int:
         name = _name(request)
@@ -570,10 +589,22 @@ class Helper:
     def _prepare_host(self) -> None:
         _enable_forwarding()
         self._ensure_bridge()
-        ip = None
-        if self.state.exposed and self.state.exposed in self.state.instances:
-            ip = self.state.instances[self.state.exposed].ip
-        self._apply_nft(ip)
+        if self._assign_ports():
+            self._save()
+        self._apply_nft()
+
+    def _assign_ports(self) -> bool:
+        """Give a group to any instance recorded before groups existed."""
+        used = {rec.port for rec in self.state.instances.values() if rec.port}
+        changed = False
+        for name, rec in self.state.instances.items():
+            if rec.port:
+                continue
+            rec.port = allocate_base_port(used)
+            used.add(rec.port)
+            note("net", "assigned port group %s to %s", rec.port, name)
+            changed = True
+        return changed
 
     def _ensure_bridge(self) -> None:
         if _run_ok(["ip", "link", "show", BRIDGE]) != 0:
@@ -594,8 +625,11 @@ class Helper:
         subprocess.run(["ip", "link", "del", host_if], check=False, capture_output=True)
         subprocess.run(["ip", "netns", "del", ns], check=False, capture_output=True)
 
-    def _apply_nft(self, ip: str | None) -> None:
-        text = nft_table(ip, self._lan())
+    def _apply_nft(self) -> None:
+        text = nft_table(
+            [(rec.ip, rec.port) for rec in self.state.instances.values() if rec.port],
+            self._lan(),
+        )
         subprocess.run(
             ["nft", "delete", "table", "ip", "clippon"],
             check=False,

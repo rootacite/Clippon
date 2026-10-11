@@ -8,6 +8,8 @@ import re
 from collections.abc import Mapping
 from pathlib import Path
 
+from clippon.ports import BASE_PORT
+
 # vb-<name> must fit in IFNAMSIZ-1 (15). "vb-" is three characters.
 _NAME = re.compile(r"[a-z][a-z0-9-]{0,11}")
 
@@ -60,11 +62,14 @@ def sunshine_conf(
     name: str,
     cert: Path | None = None,
     key: Path | None = None,
+    port: int = BASE_PORT,
 ) -> str:
     """Absolute paths so two instances never share apps or state.
 
     The server certificate may be the gateway's, so Moonlight's pinned
     identity and the certificate inside pairing answers are the same one.
+    *port* is this instance's own base port; the rest of its ports are offsets
+    from it, which is what lets several instances listen at once.
     """
     apps = directory / "apps.json"
     state = directory / "sunshine_state.json"
@@ -72,7 +77,7 @@ def sunshine_conf(
     cert = cert or (directory / "cert.pem")
     log = directory / "sunshine.log"
     return (
-        f"port = 47989\n"
+        f"port = {port}\n"
         f"address_family = ipv4\n"
         f"upnp = disabled\n"
         f"sunshine_name = {name}\n"
@@ -108,6 +113,7 @@ def meta_document(
     audio: str,
     tray: str,
     verbose: bool,
+    port: int = BASE_PORT,
 ) -> str:
     return json.dumps(
         {
@@ -117,6 +123,7 @@ def meta_document(
             "audio": audio,
             "tray": tray,
             "verbose": verbose,
+            "port": port,
         },
         indent=2,
     ) + "\n"
@@ -133,16 +140,17 @@ def write_instance(
     verbose: bool,
     cert: Path | None = None,
     key: Path | None = None,
+    port: int = BASE_PORT,
 ) -> None:
     validate_name(name)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "sunshine.conf").write_text(
-        sunshine_conf(directory, name, cert, key),
+        sunshine_conf(directory, name, cert, key, port),
         encoding="utf-8",
     )
     (directory / "apps.json").write_text(apps_document(name), encoding="utf-8")
     (directory / "meta.json").write_text(
-        meta_document(command, resolution, sink, audio, tray, verbose),
+        meta_document(command, resolution, sink, audio, tray, verbose, port),
         encoding="utf-8",
     )
 

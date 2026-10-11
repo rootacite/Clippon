@@ -1,11 +1,12 @@
 """Host listeners for 47989, 47984 and 47990.
 
-47989 and 47984 are the GameStream control plane. serverinfo is answered
-here, with LocalIP set to the address the client dialed. applist, launch,
-resume, cancel and pair are sent on to a backend over its veth address, and
-box art is a screenshot of the instance the app belongs to. launch also points
-the stream-port DNAT at that backend and rewrites sessionUrl0. 47990 is a raw
-TCP proxy onto the exposed instance's web UI.
+47989 and 47984 are the GameStream control plane. serverinfo is answered here,
+per client: a client is told about its own session only, so two clients can
+stream two instances at once. applist, launch, resume, cancel and pair are sent
+on to a backend over its veth address, on that instance's own port group, and
+box art is a screenshot of the instance the app belongs to. launch also
+rewrites sessionUrl0 onto the address the client dialed. 47990 is a raw TCP
+proxy onto the exposed instance's web UI.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import ssl
 import subprocess
 import threading
 import time
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import uuid as uuidlib
@@ -42,11 +44,43 @@ from clippon.identity import Identity
 from clippon.pair import Pairing
 from clippon.instance import instance_dir, state_home
 from clippon.log import error, note
-from clippon.ports import GAMESTREAM_HTTP, GAMESTREAM_HTTPS, WEB_UI
+from clippon.ports import (
+    BASE_PORT,
+    GAMESTREAM_HTTP,
+    GAMESTREAM_HTTPS,
+    WEB_UI,
+    PortGroup,
+    base_port_ok,
+    port_group,
+)
 from clippon.protocol import HELPER_SOCK, recv_obj, send_obj
+from clippon.sessions import Sessions
 
 _HOSTNAME = "clippon"
 HANDSHAKE_TIMEOUT = 10.0
+
+
+@dataclass(frozen=True)
+class Backend:
+    """One live instance, as the helper recorded it."""
+
+    name: str
+    ip: str
+    port: int
+    internal: str | None = None  # the app id this Sunshine knows the app by
+
+    @property
+    def ports(self) -> PortGroup:
+        return port_group(self.port)
+
+
+@dataclass(frozen=True)
+class HostStatus:
+    """What the backends report right now: who is running which app."""
+
+    busy: dict[str, int]
+    codec: str = "0"
+    max_luma: str = "0"
 
 
 class Front:
@@ -59,11 +93,26 @@ class Front:
             on_paired=self.clients.add,
         )
         self.artwork = LiveArtwork()
+        self.sessions = Sessions()
         self._routes: dict[int, tuple[str, str]] = {}
         self._lock = threading.Lock()
 
     def submit_pin(self, pin: str) -> str:
         return self.pairing.submit_pin(pin)
+
+    def release(self, instance: str) -> int:
+        """Give an instance back: stop its app and drop the records claiming it.
+
+        A client that vanishes mid-stream leaves the backend reporting the app
+        running, and that instance then stays hidden from everyone. This is the
+        way out without stopping the instance.
+        """
+        dropped = self.sessions.forget_instance(instance)
+        backend = next((item for item in self._backends() if item.name == instance), None)
+        if backend is not None:
+            self._cancel_backend(backend)
+        note("gate", "released %s; %s client session(s) dropped", instance, dropped)
+        return dropped
 
     def start(self) -> None:
         self._serve_http(GAMESTREAM_HTTP, https=False)
@@ -91,7 +140,7 @@ class Front:
             _write(handler, 200, body)
             return
         if kind == "local":
-            body = self._serverinfo(local_ip, paired).encode()
+            body = self._serverinfo(local_ip, paired, peer).encode()
             _write(handler, 200, body)
             return
         if not may_use_host(path, paired):
@@ -112,31 +161,30 @@ class Front:
                 _write(handler, 200, picture, "image/png")
                 return
         try:
-            status, body = self._forward(target, local_ip)
+            status, body = self._forward(target, local_ip, peer)
         except (OSError, ClipponError, ValueError) as exc:
             error("gate", "%s %s failed: %s", "https" if https else "http", target, exc)
             _write(handler, 502, _status_page(502, "backend unavailable").encode())
             return
         _write(handler, status, body)
 
-    def _serverinfo(self, local_ip: str, paired: bool) -> str:
-        codec = "0"
-        luma = "0"
+    def _serverinfo(self, local_ip: str, paired: bool, fingerprint: str | None) -> str:
+        """One client's view of the host.
+
+        A paired client is told about its own session and nothing else, which is
+        what lets a second client start an app while the first one is streaming.
+        The plain HTTP port carries no certificate, so it keeps the old global
+        answer; that is the pre-pairing path, where there is no session yet.
+        """
+        status = self._host_status()
         current = 0
-        for name, ip in self._live():
-            try:
-                status, raw = _http_get(ip, GAMESTREAM_HTTP, "/serverinfo", 2.0)
-            except OSError:
-                continue
-            if status != 200:
-                continue
-            text = raw.decode("utf-8", "replace")
-            if codec == "0":
-                codec = xml_text(text, "ServerCodecModeSupport") or "0"
-                luma = xml_text(text, "MaxLumaPixelsHEVC") or "0"
-            game = xml_text(text, "currentgame") or "0"
-            if game.isdigit() and int(game) > 0:
-                current = external_app_id(name, game)
+        if paired:
+            mine = self.sessions.live(status.busy).get(fingerprint or "")
+            if mine is not None:
+                current = mine[1]
+        else:
+            for name in sorted(status.busy):
+                current = external_app_id(name, status.busy[name])
                 break
         return serverinfo_xml(
             local_ip=local_ip,
@@ -144,46 +192,91 @@ class Front:
             hostname=_HOSTNAME,
             paired=paired,
             current_game=current,
-            codec_flags=codec,
-            max_luma=luma,
+            codec_flags=status.codec,
+            max_luma=status.max_luma,
         )
 
-    def _forward(self, target: str, local_ip: str) -> tuple[int, bytes]:
+    def _forward(self, target: str, local_ip: str, fingerprint: str | None) -> tuple[int, bytes]:
         path = target.split("?", 1)[0]
         timeout = 180.0 if path == "/pair" else 20.0
         if path == "/applist":
-            return 200, self._applist().encode()
-        backend = self._backend_for(target)
+            return 200, self._applist(fingerprint).encode()
+        backend = self._backend_for(target, fingerprint)
         if backend is None:
             return 404, _status_page(404, "no backend for this request").encode()
-        name, ip, internal = backend
+        if path == "/launch":
+            refusal = self._launch_guard(backend, fingerprint)
+            if refusal is not None:
+                return refusal
+        internal = backend.internal
         forwarded = replace_query_appid(target, internal) if internal else target
-        if path in {"/launch", "/resume", "/cancel"} or (path == "/pair" and internal is None):
-            self._expose(name)
-        status, body = _https_get(ip, GAMESTREAM_HTTPS, forwarded, self.identity, timeout)
-        if path in {"/launch", "/resume"} and b"sessionUrl0" in body:
+        status, body = _https_get(
+            backend.ip, backend.ports.https, forwarded, self.identity, timeout
+        )
+        if path in {"/launch", "/resume"} and status == 200 and b"sessionUrl0" in body:
+            self.sessions.remember(fingerprint, backend.name)
+            note("gate", "%s is streaming %s", _short(fingerprint), backend.name)
             try:
                 body = rewrite_session_host(body.decode("utf-8", "replace"), local_ip).encode()
             except ValueError as exc:
                 note("gate", "sessionUrl0 left unchanged: %s", exc)
+        elif path == "/cancel" and status == 200:
+            self.sessions.forget(fingerprint)
         return status, body
 
-    def _applist(self) -> str:
+    def _launch_guard(self, backend: Backend, fingerprint: str | None) -> tuple[int, bytes] | None:
+        """Refuse a launch someone else is streaming, finish a stale one.
+
+        The refusal is the gateway's own answer, so the client never reaches a
+        backend that would report "an app is already running" for an instance
+        the client cannot even see. When nobody else holds the instance, a
+        leftover app is cancelled first, which makes /launch idempotent: an app
+        with no command never stops by itself.
+        """
+        busy = self._host_status().busy
+        if self.sessions.holder(backend.name, busy, fingerprint) is not None:
+            note("gate", "%s is streamed by another client; refusing launch", backend.name)
+            return 503, _status_page(
+                503, "another client is already streaming this application"
+            ).encode()
+        if backend.name in busy:
+            note("gate", "%s still reports an app; cancelling it first", backend.name)
+            self._cancel_backend(backend)
+        return None
+
+    def _applist(self, fingerprint: str | None) -> str:
+        """The merged list, with instances someone else is streaming left out.
+
+        The instance names and ids stay stable, so a client's cached list only
+        gains and loses entries; its stored ids keep resolving.
+        """
+        hidden: set[str] = set()
+        if self.sessions.active():
+            hidden = self.sessions.hidden(self._host_status().busy, fingerprint)
+        sources = self._applist_sources()
+        merged, table = merge_applists(sources, hidden)
+        self._remember_routes(table)
+        return merged
+
+    def _applist_sources(self) -> list[tuple[str, str]]:
         sources: list[tuple[str, str]] = []
-        for name, ip in self._live():
+        for backend in self._backends():
             try:
-                status, raw = _https_get(ip, GAMESTREAM_HTTPS, "/applist", self.identity, 8.0)
+                status, raw = _https_get(
+                    backend.ip, backend.ports.https, "/applist", self.identity, 8.0
+                )
             except OSError as exc:
-                note("gate", "applist %s skipped: %s", name, exc)
+                note("gate", "applist %s skipped: %s", backend.name, exc)
                 continue
             if status != 200:
-                note("gate", "applist %s returned HTTP %s", name, status)
+                note("gate", "applist %s returned HTTP %s", backend.name, status)
                 continue
-            sources.append((name, raw.decode("utf-8", "replace")))
-        merged, table = merge_applists(sources)
+            sources.append((backend.name, raw.decode("utf-8", "replace")))
+        return sources
+
+    def _remember_routes(self, table: dict[int, tuple[str, str]]) -> None:
         with self._lock:
             self._routes = table
-        return merged
 
     def _live_box_art(self, target: str) -> bytes | None:
         """The instance's own screen, for the app the client asked about.
@@ -210,16 +303,16 @@ class Front:
         if found is None:
             # A client can remember ids across a gateway restart, so rebuild the
             # table from the backends before giving up on the request.
-            self._applist()
+            _merged, table = merge_applists(self._applist_sources())
+            self._remember_routes(table)
             with self._lock:
                 found = self._routes.get(external)
         return found
 
-    def _backend_for(self, target: str) -> tuple[str, str, str | None] | None:
+    def _backend_for(self, target: str, fingerprint: str | None) -> Backend | None:
         path = target.split("?", 1)[0]
-        live = dict(self._live())
-        exposed, exposed_ip = self._exposed()
-        if path in {"/launch", "/appasset"}:
+        live = {backend.name: backend for backend in self._backends()}
+        if path in {"/launch", "/resume", "/appasset"}:
             external = _query_value(target, "appid")
             if external is None or not external.isdigit():
                 return None
@@ -227,33 +320,55 @@ class Front:
             if found is None:
                 return None
             name, internal = found
-            ip = live.get(name)
-            if ip is None:
+            backend = live.get(name)
+            if backend is None:
                 return None
-            return name, ip, internal
+            return replace(backend, internal=internal)
+        if path == "/cancel":
+            # A cancel belongs to the client that started the session, which is
+            # not necessarily the instance the web UI points at.
+            mine = self.sessions.claimed(fingerprint)
+            if mine is not None and mine in live:
+                return live[mine]
         if path == "/pair":
-            if exposed is not None and exposed_ip is not None:
-                return exposed, exposed_ip, None
-            live = self._live()
+            exposed = self._exposed()
+            if exposed is not None:
+                return exposed
             if not live:
                 return None
-            return live[0][0], live[0][1], None
-        if exposed is None or exposed_ip is None:
-            return None
-        return exposed, exposed_ip, None
+            return next(iter(live.values()))
+        return self._exposed()
 
-    def _expose(self, name: str) -> None:
-        _call_helper({"op": "expose", "name": name})
-        note("gate", "stream ports follow %s", name)
-
-    def _live(self) -> list[tuple[str, str]]:
+    def _cancel_backend(self, backend: Backend) -> None:
         try:
-            status = _call_helper({"op": "status"})
-        except ClipponError as exc:
-            note("gate", "clippon-net unavailable: %s", exc)
-            return []
-        raw = status.get("instances")
-        found: list[tuple[str, str]] = []
+            _https_get(backend.ip, backend.ports.https, "/cancel", self.identity, 10.0)
+        except OSError as exc:
+            note("gate", "cancel on %s failed: %s", backend.name, exc)
+
+    def _host_status(self) -> HostStatus:
+        """Poll every live backend for the app it reports running."""
+        busy: dict[str, int] = {}
+        codec = "0"
+        luma = "0"
+        for backend in self._backends():
+            try:
+                status, raw = _http_get(backend.ip, backend.ports.http, "/serverinfo", 2.0)
+            except OSError:
+                continue
+            if status != 200:
+                continue
+            text = raw.decode("utf-8", "replace")
+            if codec == "0":
+                codec = xml_text(text, "ServerCodecModeSupport") or "0"
+                luma = xml_text(text, "MaxLumaPixelsHEVC") or "0"
+            game = xml_text(text, "currentgame") or "0"
+            if game.isdigit() and int(game) > 0:
+                busy[backend.name] = int(game)
+        return HostStatus(busy=busy, codec=codec, max_luma=luma)
+
+    def _backends(self) -> list[Backend]:
+        raw = self._status().get("instances")
+        found: list[Backend] = []
         if not isinstance(raw, dict):
             return found
         for name, rec in raw.items():
@@ -262,23 +377,34 @@ class Front:
             if rec.get("exited") or not isinstance(rec.get("pid"), int):
                 continue
             ip = rec.get("ip")
-            if isinstance(ip, str):
-                found.append((name, ip))
+            if not isinstance(ip, str):
+                continue
+            port = rec.get("port")
+            found.append(
+                Backend(name=name, ip=ip, port=port if base_port_ok(port) else BASE_PORT)
+            )
         return found
 
-    def _exposed(self) -> tuple[str | None, str | None]:
-        try:
-            status = _call_helper({"op": "status"})
-        except ClipponError:
-            return None, None
+    def _exposed(self) -> Backend | None:
+        status = self._status()
         name = status.get("exposed")
         raw = status.get("instances")
         if not isinstance(name, str) or not isinstance(raw, dict):
-            return None, None
+            return None
         rec = raw.get(name)
         if not isinstance(rec, dict) or not isinstance(rec.get("ip"), str):
-            return None, None
-        return name, rec["ip"]
+            return None
+        port = rec.get("port")
+        return Backend(
+            name=name, ip=rec["ip"], port=port if base_port_ok(port) else BASE_PORT
+        )
+
+    def _status(self) -> dict[str, object]:
+        try:
+            return _call_helper({"op": "status"})
+        except ClipponError as exc:
+            note("gate", "clippon-net unavailable: %s", exc)
+            return {}
 
     def _serve_http(self, port: int, https: bool) -> None:
         try:
@@ -310,17 +436,19 @@ class Front:
             threading.Thread(target=self._proxy_web, args=(client,), daemon=True).start()
 
     def _proxy_web(self, client: socket.socket) -> None:
-        _name, ip = self._exposed()
-        if ip is None:
+        backend = self._exposed()
+        if backend is None:
             client.close()
             return
         try:
-            backend = socket.create_connection((ip, WEB_UI), timeout=10)
+            upstream = socket.create_connection(
+                (backend.ip, backend.ports.web), timeout=10
+            )
         except OSError as exc:
-            note("gate", "web proxy to %s failed: %s", ip, exc)
+            note("gate", "web proxy to %s failed: %s", backend.ip, exc)
             client.close()
             return
-        _splice(client, backend)
+        _splice(client, upstream)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -357,6 +485,10 @@ def _peer_fingerprint(connection: object) -> str | None:
     presented no certificate (the plain HTTP port, an unknown client) has none.
     """
     return getattr(connection, "peer_fingerprint", None)
+
+
+def _short(fingerprint: str | None) -> str:
+    return (fingerprint or "no-certificate")[:8]
 
 
 def _server_for(port: int, https: bool, identity: Identity) -> ThreadingHTTPServer:

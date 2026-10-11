@@ -18,6 +18,7 @@ from clippon.config import DEFAULT_SINK, ClipponError
 from clippon.front import ensure_identity, instance_certificate, open_front, trust_instance
 from clippon.instance import instance_dir, read_meta, state_home, validate_name, write_instance
 from clippon.log import error, note, setup_logging
+from clippon.ports import BASE_PORT, base_port_ok
 from clippon.sunshine import managed_tray
 from clippon.net_helper import alive
 from clippon.protocol import HELPER_SOCK, daemon_sock, recv_obj, send_obj
@@ -101,6 +102,12 @@ class Daemon:
             name = _required_name(request)
             self.stop(name)
             return {"ok": True, "message": f"stopped {name}"}
+        if op == "release":
+            name = _required_name(request)
+            if self.front is None:
+                raise ClipponError("gateway is not running")
+            dropped = self.front.release(name)
+            return {"ok": True, "message": f"released {name} ({dropped} client session(s))"}
         if op == "start":
             return self.start(request)
         if op == "pin":
@@ -126,6 +133,7 @@ class Daemon:
                     {
                         "name": name,
                         "ip": rec.get("ip") or "",
+                        "port": rec.get("port") if base_port_ok(rec.get("port")) else BASE_PORT,
                         "pid": rec.get("pid"),
                         "exited": bool(rec.get("exited")),
                         "command": command if isinstance(command, list) else [],
@@ -162,23 +170,29 @@ class Daemon:
         identity = ensure_identity()
         shared = instance_certificate()
         cert, key = shared if shared is not None else (None, None)
-        write_instance(
-            directory,
-            name,
-            list(command),
-            resolution,
-            sink,
-            audio,
-            tray,
-            verbose,
-            cert=cert,
-            key=key,
-        )
-        trust_instance(directory, identity, name)
+        # The helper owns the port groups, so the config is written from what it
+        # just handed out.
+        created = self._call({"op": "create", "name": name})
+        port = created.get("port")
+        if not base_port_ok(port):
+            port = BASE_PORT
         log_path = directory / "spawn.log"
-        log_path.touch(exist_ok=True)
-        self._call({"op": "create", "name": name})
         try:
+            write_instance(
+                directory,
+                name,
+                list(command),
+                resolution,
+                sink,
+                audio,
+                tray,
+                verbose,
+                cert=cert,
+                key=key,
+                port=port,
+            )
+            trust_instance(directory, identity, name)
+            log_path.touch(exist_ok=True)
             spawned = self._call(
                 {
                     "op": "spawn",
@@ -188,7 +202,7 @@ class Daemon:
                     "stdout": str(log_path),
                 }
             )
-        except ClipponError:
+        except (ClipponError, OSError):
             self._destroy_quiet(name)
             raise
         pid = spawned.get("pid")
@@ -211,10 +225,11 @@ class Daemon:
         lan = listed.get("lan") if isinstance(listed.get("lan"), list) else []
         return {
             "ok": True,
-            "message": f"started {name} pid {pid} at {ip}",
+            "message": f"started {name} pid {pid} at {ip}, ports from {port}",
             "name": name,
             "pid": pid,
             "ip": ip,
+            "port": port,
             "lan": lan,
         }
 

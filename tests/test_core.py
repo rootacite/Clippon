@@ -44,7 +44,18 @@ from clippon.instance import (
 from clippon.net_helper import orphan_namespaces, spawn_command
 from clippon import net_helper
 from clippon.pair import Pairing
-from clippon.ports import allocate_host, docker_user_checks, lan_from_ip_json, nft_table
+from clippon.sessions import Sessions
+from clippon.ports import (
+    BASE_PORT,
+    PORT_STRIDE,
+    allocate_base_port,
+    allocate_host,
+    base_port_ok,
+    docker_user_checks,
+    lan_from_ip_json,
+    nft_table,
+    port_group,
+)
 from clippon.proc import all_pids, env_has_pair, env_value, shell_status
 from clippon.protocol import dumps, loads
 from clippon.sunshine import fatal_lines, managed_env, managed_tray, tray_plan
@@ -347,25 +358,69 @@ class InstanceLayoutTests(unittest.TestCase):
         self.assertIn(f"file_apps = {root / 'apps.json'}", sunshine_conf(root, "desk"))
         self.assertIn('"name": "desk"', apps_document("desk"))
 
+    def test_an_instance_writes_its_own_base_port(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_instance(
+                root,
+                "desk",
+                ["sleep", "30"],
+                "1280x720",
+                "cage-sink",
+                "enabled",
+                "auto",
+                False,
+                port=48989,
+            )
+            text = (root / "sunshine.conf").read_text(encoding="utf-8")
+            meta = json_apps(root / "meta.json")
+        self.assertIn("port = 48989\n", text)
+        self.assertNotIn("port = 47989", text)
+        self.assertEqual(meta["port"], 48989)
+        # The default stays the first group, which the gateway also listens on.
+        self.assertIn("port = 47989\n", sunshine_conf(root, "desk"))
+
 
 class PortTableTests(unittest.TestCase):
-    def test_expose_dnats_only_the_stream_ports(self) -> None:
-        exposed = nft_table("10.200.0.2")
-        self.assertIn("dnat to 10.200.0.2", exposed)
-        for port in (47998, 47999, 48000, 48010):
-            self.assertIn(str(port), exposed)
+    def test_every_instance_gets_its_own_group_mapped(self) -> None:
+        text = nft_table([("10.200.0.2", BASE_PORT), ("10.200.0.3", BASE_PORT + PORT_STRIDE)])
+        self.assertIn("dnat to 10.200.0.2", text)
+        self.assertIn("dnat to 10.200.0.3", text)
+        for port in (47998, 47999, 48000, 48010, 48998, 48999, 49000, 49010):
+            self.assertIn(str(port), text)
+        # 47984, 47989 and 47990 stay with the gateway.
         for port in (47984, 47989, 47990):
-            self.assertNotIn(str(port), exposed)
-        self.assertNotIn("dnat to", nft_table(None))
+            self.assertNotIn(str(port), text)
+        self.assertNotIn("dnat to", nft_table())
         self.assertEqual(allocate_host(set()), 2)
         self.assertEqual(allocate_host({2, 3}), 4)
+
+    def test_port_groups_follow_sunshine_offsets_and_stay_apart(self) -> None:
+        group = port_group()
+        self.assertEqual((group.http, group.https, group.web), (47989, 47984, 47990))
+        self.assertEqual(
+            (group.rtsp, group.video, group.control, group.audio),
+            (48010, 47998, 47999, 48000),
+        )
+        self.assertEqual(allocate_base_port(set()), BASE_PORT)
+        self.assertEqual(allocate_base_port({BASE_PORT}), BASE_PORT + PORT_STRIDE)
+        second = port_group(BASE_PORT + PORT_STRIDE)
+        self.assertGreater(second.https - group.rtsp, 1)
+        self.assertTrue(base_port_ok(1019))
+        self.assertTrue(base_port_ok(65514))
+        self.assertFalse(base_port_ok(1018))
+        self.assertFalse(base_port_ok(65515))
+        self.assertFalse(base_port_ok(None))
+        taken = {BASE_PORT + PORT_STRIDE * step for step in range(1000)}
+        with self.assertRaises(ValueError):
+            allocate_base_port(taken)
 
     def test_local_clients_get_the_same_dnat_on_the_output_hook(self) -> None:
         def output_chain(text: str) -> str:
             # The address set contains "}", so cut on the chain's own terminator.
             return text.split("chain output {")[1].split("\n  }")[0]
 
-        text = nft_table("10.200.0.2", ["192.168.4.4", "10.0.0.7"])
+        text = nft_table([("10.200.0.2", BASE_PORT)], ["192.168.4.4", "10.0.0.7"])
         output = output_chain(text)
         self.assertIn("ip daddr { 10.0.0.7, 192.168.4.4 } tcp dport", output)
         self.assertIn("dnat to 10.200.0.2", output)
@@ -373,8 +428,8 @@ class PortTableTests(unittest.TestCase):
             self.assertIn(str(port), output)
         # Without a LAN address there is nothing to match on locally, and a
         # bare "tcp dport 48010" would hijack traffic to other hosts.
-        self.assertNotIn("dnat", output_chain(nft_table("10.200.0.2")))
-        self.assertNotIn("dnat", output_chain(nft_table(None, ["192.168.4.4"])))
+        self.assertNotIn("dnat", output_chain(nft_table([("10.200.0.2", BASE_PORT)])))
+        self.assertNotIn("dnat", output_chain(nft_table([], ["192.168.4.4"])))
 
     def test_lan_addresses_skip_the_bridge_and_docker(self) -> None:
         payload = [
@@ -417,6 +472,18 @@ class GatewayPureTests(unittest.TestCase):
             self.assertEqual(internal, "1")
             self.assertEqual(external, external_app_id(instance, internal))
 
+    def test_a_hidden_instance_leaves_the_applist_but_keeps_its_ids(self) -> None:
+        alpha = "<root><App><AppTitle>x</AppTitle><ID>1</ID></App></root>"
+        beta = "<root><App><AppTitle>y</AppTitle><ID>1</ID></App></root>"
+        merged, table = merge_applists(
+            [("alpha", alpha), ("beta", beta)], hidden={"alpha"}
+        )
+        self.assertNotIn(">alpha<", merged)
+        self.assertIn(">beta<", merged)
+        # A client with a cached id still gets a real route, not a 404.
+        self.assertIn(("alpha", "1"), table.values())
+        self.assertIn(("beta", "1"), table.values())
+
     def test_serverinfo_uses_the_dialed_address(self) -> None:
         xml = serverinfo_xml(local_ip="192.168.4.4", unique_id="ABC", hostname="clippon")
         self.assertIn("<LocalIP>192.168.4.4</LocalIP>", xml)
@@ -441,6 +508,54 @@ class GatewayPureTests(unittest.TestCase):
         self.assertIn("rtspenc://192.168.1.20:48010", rewrite_session_host(encrypted, "192.168.1.20"))
 
 
+class SessionTests(unittest.TestCase):
+    """The per-client session table, which is what makes two streams possible."""
+
+    def test_a_record_lives_only_while_its_backend_reports_the_app(self) -> None:
+        sessions = Sessions()
+        sessions.remember("aa", "alpha")
+        busy = {"alpha": 7}
+        self.assertEqual(sessions.live(busy), {"aa": ("alpha", external_app_id("alpha", "7"))})
+        # The backend says the app is gone: the next answer drops the record,
+        # so a client that never sends /cancel cannot hold the instance.
+        self.assertEqual(sessions.live({"beta": 7}), {})
+        self.assertFalse(sessions.active())
+
+    def test_an_instance_streamed_by_someone_else_is_hidden(self) -> None:
+        sessions = Sessions()
+        sessions.remember("aa", "alpha")
+        busy = {"alpha": 1}
+        self.assertEqual(sessions.hidden(busy, "bb"), {"alpha"})
+        self.assertEqual(sessions.hidden(busy, "aa"), set())
+
+    def test_the_holder_is_told_apart_from_the_client_itself(self) -> None:
+        sessions = Sessions()
+        sessions.remember("aa", "alpha")
+        busy = {"alpha": 1, "beta": 1}
+        self.assertEqual(sessions.holder("alpha", busy, "bb"), "aa")
+        self.assertIsNone(sessions.holder("alpha", busy, "aa"))
+        self.assertIsNone(sessions.holder("beta", busy, "aa"))
+        self.assertIsNone(sessions.holder("alpha", {}, "bb"))
+
+    def test_release_drops_every_record_for_one_instance(self) -> None:
+        sessions = Sessions()
+        sessions.remember("aa", "alpha")
+        sessions.remember("bb", "alpha")
+        sessions.remember("cc", "beta")
+        self.assertEqual(sessions.forget_instance("alpha"), 2)
+        self.assertEqual(sessions.claimed("aa"), None)
+        self.assertEqual(sessions.live({"alpha": 1, "beta": 1}), {"cc": ("beta", external_app_id("beta", "1"))})
+
+    def test_cancel_looks_up_the_instance_the_client_launched(self) -> None:
+        sessions = Sessions()
+        self.assertIsNone(sessions.claimed(None))
+        self.assertIsNone(sessions.claimed("aa"))
+        sessions.remember("aa", "alpha")
+        self.assertEqual(sessions.claimed("aa"), "alpha")
+        sessions.forget("aa")
+        self.assertIsNone(sessions.claimed("aa"))
+
+
 class CtlProtocolTests(unittest.TestCase):
     def test_start_is_one_json_line_and_stops_at_the_command(self) -> None:
         request = parse_ctl(
@@ -461,25 +576,39 @@ class CtlProtocolTests(unittest.TestCase):
         self.assertEqual(parse_ctl(["hide"]), {"op": "hide"})
         self.assertEqual(parse_ctl(["expose", "desk"]), {"op": "expose", "name": "desk"})
         self.assertEqual(parse_ctl(["stop", "desk"]), {"op": "stop", "name": "desk"})
+        self.assertEqual(parse_ctl(["release", "desk"]), {"op": "release", "name": "desk"})
         with self.assertRaises(ClipponError):
             parse_ctl(["expose"])
         with self.assertRaises(ClipponError):
             parse_ctl(["start", "Nope", "--", "true"])
 
-    def test_format_list_marks_the_exposed_instance(self) -> None:
+    def test_format_list_names_the_port_group_and_the_web_instance(self) -> None:
         text = format_list(
             {
                 "lan": ["192.168.1.20"],
                 "exposed": "desk",
                 "instances": [
-                    {"name": "desk", "ip": "10.200.0.2", "pid": 40, "command": ["sleep", "30"]},
-                    {"name": "other", "ip": "10.200.0.3", "pid": None, "command": ["true"]},
+                    {
+                        "name": "desk",
+                        "ip": "10.200.0.2",
+                        "port": 47989,
+                        "pid": 40,
+                        "command": ["sleep", "30"],
+                    },
+                    {
+                        "name": "other",
+                        "ip": "10.200.0.3",
+                        "port": 48989,
+                        "pid": None,
+                        "command": ["true"],
+                    },
                 ],
             }
         )
         self.assertIn("192.168.1.20", text)
         self.assertIn("desk", text)
-        self.assertIn("exposed", text)
+        self.assertIn("web", text)
+        self.assertIn("48989", text)
         self.assertIn("10.200.0.3", text)
 
 

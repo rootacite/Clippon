@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 import zlib
+from collections.abc import Set as AbstractSet
 
 _URL = re.compile(r"(rtspenc|rtsp)://(\[[^\]]+\]|[^:/]+):(\d+)\s*$")
 _APPID = re.compile(r"([?&]appid=)[^&]*")
@@ -98,10 +99,14 @@ def external_app_id(instance: str, internal: str) -> int:
 
 def merge_applists(
     sources: list[tuple[str, str]],
+    hidden: AbstractSet[str] = frozenset(),
 ) -> tuple[str, dict[int, tuple[str, str]]]:
     """Merge backend applist documents. The title Moonlight shows is the instance name.
 
     Returns the combined XML and a map of external id -> (instance, internal id).
+    An instance in *hidden* is left out of the XML — another client is streaming
+    it — while its ids stay in the table, so a client that cached one still gets
+    a real answer instead of a 404.
     """
     root = ET.Element("root")
     root.set("status_code", "200")
@@ -114,6 +119,8 @@ def merge_applists(
             while external in table and table[external] != (instance, internal):
                 external = (external + 1) & 0x7FFFFFFF or 1
             table[external] = (instance, internal)
+            if instance in hidden:
+                continue
             node = ET.SubElement(root, "App")
             ET.SubElement(node, "AppTitle").text = instance
             ET.SubElement(node, "ID").text = str(external)

@@ -19,13 +19,17 @@ Usage: clipponctl <command>
   list
   start NAME [--verbose] [--res AxB[@C[Hz]]] [--env K=V]... [--] <command> [args...]
   stop NAME
+  release NAME
   expose NAME
   hide
   pin 1234
 
-start runs that command inside its own network namespace. expose points the
-stream ports at one instance. hide removes that mapping. pin submits the
-4-digit PIN Moonlight is showing.
+start runs that command inside its own network namespace on its own port
+group, so several instances can stream at the same time. expose points the
+47990 web UI proxy at one instance; every instance's stream ports stay open.
+release stops the app an instance is running and forgets the client sessions
+that claim it, which is the way out when a client vanished mid-stream. pin
+submits the 4-digit PIN Moonlight is showing.
 Options for start follow the same rules as clippon and must come before the
 command. --env KEY=VALUE reaches cage and the program it runs, which is how a
 session gets variables the daemon does not have, e.g.
@@ -49,7 +53,7 @@ def parse_ctl(argv: list[str], environ: Mapping[str, str] | None = None) -> dict
         if len(pin) != 4 or not pin.isdigit():
             raise ClipponError("PIN must be 4 digits", code=2)
         return {"op": "pin", "pin": pin}
-    if op in ("stop", "expose") and len(argv) == 2:
+    if op in ("stop", "expose", "release") and len(argv) == 2:
         _name(argv[1])
         return {"op": op, "name": argv[1]}
     if op == "start":
@@ -87,19 +91,24 @@ def format_list(response: dict[str, object]) -> str:
     if not isinstance(rows, list) or not rows:
         lines.append("(no instances)")
         return "\n".join(lines)
+    lines.append(
+        f"{'name':<12} {'address':<16} {'base':<6} {'pid':<11} {'state':<8} command"
+    )
     for row in rows:
         if not isinstance(row, dict):
             continue
         name = str(row.get("name") or "")
         ip = str(row.get("ip") or "")
+        port = row.get("port")
+        ports = str(port) if isinstance(port, int) else "-"
         pid = row.get("pid")
         pid_text = str(pid) if isinstance(pid, int) else "-"
-        mark = "exposed" if name == exposed else ""
+        mark = "web" if name == exposed else ""
         if row.get("exited"):
             mark = "exited"
         command = row.get("command")
         cmd = shlex.join(command) if isinstance(command, list) else ""
-        lines.append(f"{name:<12} {ip:<16} pid {pid_text:<8} {mark:<8} {cmd}".rstrip())
+        lines.append(f"{name:<12} {ip:<16} {ports:<6} pid {pid_text:<8} {mark:<8} {cmd}".rstrip())
     return "\n".join(lines)
 
 
