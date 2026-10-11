@@ -12,7 +12,12 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 from clippon.audio import AudioInstance, pipewire_dropin, wireplumber_dropin
-from clippon.cage import cage_environment, client_argv, wayland_socket_on_line
+from clippon.cage import (
+    cage_environment,
+    client_argv,
+    desktop_keys,
+    wayland_socket_on_line,
+)
 from clippon.config import (
     DEFAULT_RES,
     SHIM_PATH,
@@ -813,6 +818,54 @@ class EnvOptionTests(unittest.TestCase):
     def test_cage_gets_the_requested_variables(self) -> None:
         env = cage_environment({}, extra={"GTK_IM_MODULE": "fcitx"})
         self.assertEqual(env["GTK_IM_MODULE"], "fcitx")
+
+    def test_desktop_keys_keep_only_the_identity_plasma_imports(self) -> None:
+        found = desktop_keys(
+            "\n".join(
+                (
+                    "XDG_CURRENT_DESKTOP=KDE",
+                    "XDG_CONFIG_DIRS=/home/me/.config/kdedefaults:/etc/xdg",
+                    "KDE_FULL_SESSION=true",
+                    "PATH=/usr/bin",
+                    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1/bus",
+                    "XDG_CURRENT_DESKTOP=",
+                    "NOT_A_PAIR",
+                )
+            )
+        )
+        self.assertEqual(
+            found,
+            {
+                "XDG_CURRENT_DESKTOP": "KDE",
+                "XDG_CONFIG_DIRS": "/home/me/.config/kdedefaults:/etc/xdg",
+                "KDE_FULL_SESSION": "true",
+            },
+        )
+
+    def test_a_headless_session_adopts_the_desktop_identity(self) -> None:
+        session = {
+            "XDG_CURRENT_DESKTOP": "KDE",
+            "KDE_SESSION_VERSION": "6",
+            "XDG_CONFIG_DIRS": "/home/me/.config/kdedefaults:/etc/xdg",
+            "PATH": "/should/not/copy",
+        }
+        with mock.patch.dict(os.environ, {"HOME": "/home/me"}, clear=True):
+            env = cage_environment({}, session=session)
+        self.assertEqual(env["XDG_CURRENT_DESKTOP"], "KDE")
+        self.assertEqual(env["KDE_SESSION_VERSION"], "6")
+        self.assertEqual(env["XDG_CONFIG_DIRS"], "/home/me/.config/kdedefaults:/etc/xdg")
+        self.assertNotIn("PATH", env)
+
+    def test_an_inherited_or_requested_desktop_is_kept(self) -> None:
+        session = {"XDG_CURRENT_DESKTOP": "KDE", "XDG_SESSION_DESKTOP": "KDE"}
+        with mock.patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "GNOME"}, clear=True):
+            inherited = cage_environment({}, session=session)
+            requested = cage_environment(
+                {}, extra={"XDG_SESSION_DESKTOP": "xfce"}, session=session
+            )
+        self.assertEqual(inherited["XDG_CURRENT_DESKTOP"], "GNOME")
+        self.assertEqual(inherited["XDG_SESSION_DESKTOP"], "KDE")
+        self.assertEqual(requested["XDG_SESSION_DESKTOP"], "xfce")
 
     def test_requested_variables_win_over_the_inherited_ones(self) -> None:
         with mock.patch.dict(os.environ, {"GTK_IM_MODULE": "ibus"}):

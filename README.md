@@ -80,7 +80,7 @@ Sunshine's virtual keyboard and mice are ordinary `uinput` devices, and by defau
 - A udev rule runs a helper that reads that tag and assigns the device to `seat-cage-<session>`, and a second shim makes cage report that seat name.
 - Cage then opens that seat and no other, so each session sees only its own keyboard and mice, and the host desktop sees neither.
 
-One more shim exists because wlroots 0.20 never reads the `WL_OUTPUT` property that would map a pointer onto the headless output: absolute pointer events would leave the cursor where it is. The shim maps every attached input device onto the output layout's centre output.
+One more shim exists because wlroots 0.20 never reads the `WL_OUTPUT` property that would map a pointer onto the headless output: absolute pointer events would leave the cursor where it is. The shim maps every attached input device onto the output layout's centre output. It also hides that cursor while a touchscreen is the latest input, and shows it again on the next mouse move, click or scroll. Cage otherwise keeps the pointer image on screen, and with software cursors that image is part of the captured frame.
 
 ### Audio: one stack per session
 
@@ -163,6 +163,8 @@ clipponctl start alpha \
 ```
 
 A name given this way beats the same name in the daemon's environment. The session's own settings are not up for grabs: the sink, the audio mode and the tray come from the start request, and the display, the private audio socket and the shims are set by the session itself.
+
+`clippond` is a user service, so it does not inherit the graphical session. Each session copies the desktop identity from the systemd user manager when that name is not already set: `XDG_CURRENT_DESKTOP`, `XDG_SESSION_DESKTOP`, `DESKTOP_SESSION`, `KDE_FULL_SESSION`, `KDE_SESSION_VERSION` and `XDG_CONFIG_DIRS`. Qt uses the desktop name to load the KDE platform theme, and that theme reads `~/.config/kdeglobals`, which is where Plasma stores the color scheme, the icon theme, the widget style and the fonts. A program started here follows the same theme as one started on the desktop. `--env` overrides any of these names.
 
 ## Files and state
 

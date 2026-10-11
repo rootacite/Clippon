@@ -250,7 +250,23 @@ clipponctl release alpha   后端 currentgame=0，A 的 serverinfo 归零，B �
 
 两个实例的实时封面、输入座椅、私有音频都沿用原有机制，未改动。单元测试 74 项通过。
 
+### 十五、会话继承 Plasma 的主题
+
+`clippond` 是 systemd 用户服务，进程环境里没有 `XDG_CURRENT_DESKTOP`。Qt 6.12 在 wayland 平台上用这个变量（没有时再看 `KDE_FULL_SESSION`）决定要不要加载 KDE 平台主题；插件不加载时，程序用内置的浅色调色板。KDE 里的 Dolphin 是深色 Breeze，同一程序经 `clipponctl` 启动是浅色 Breeze，图标也不是用户的 `Reversal-purple-dark`。
+
+Plasma 把桌面身份写进用户管理器（`systemctl --user show-environment`），真正的配色、图标、控件样式和字体在 `~/.config/kdeglobals`。`start_cage` 现在在会话自己还没有这些名字时，从用户管理器补上 `XDG_CURRENT_DESKTOP`、`XDG_SESSION_DESKTOP`、`DESKTOP_SESSION`、`KDE_FULL_SESSION`、`KDE_SESSION_VERSION`、`XDG_CONFIG_DIRS`。`--env` 和进程里已经有的值优先。
+
+2026-10-11 实测：`clipponctl start themeprobe` 里跑一个 PyQt6 探针，然后停掉。结果是 `XDG_CURRENT_DESKTOP=KDE`，加载了 `KDEPlasmaPlatformTheme`，样式 breeze，窗口色 `32,35,38`，视图底色 `20,22,24`（与 `kdeglobals` 的 `[Colors:View] BackgroundNormal` 一致），图标主题 `Reversal-purple-dark`，字体 `Aa草莓可颂面包圆 10`。对照：同样的探针在没有 `XDG_CURRENT_DESKTOP` 的环境下是 fusion、窗口色 `239,239,239`，不加载该插件。已经在跑的会话不会改环境，要重新 start 才跟上主题。
+
 三路并发（2026-10-11，用户实测，记录他所报告的结果）：三个 Application 同时被三个客户端打开——两个来自局域网设备、一个来自本机——未见明显问题。这一路同时覆盖了 `output` 链：本机客户端走的是 `output` 钩子上的 DNAT，而两台局域网客户端走 `prerouting`，两种路径在同一张表里同时生效。
+
+### 十六、触屏时藏起光标
+
+Artemis 的多点触控模式把手指发给主机的触摸通道，不移动鼠标。Sunshine 默认 `native_pen_touch = enabled`，客户端连上后另建一块虚拟触摸屏，触摸点写到那块屏，不写鼠标。cage 把触摸屏收成 `wl_touch`，每个 `touch_id` 单独下发；它同时始终给虚拟鼠标画着 `left_ptr`，而 `WLR_NO_HARDWARE_CURSORS=1` 把这张图画进画面。所以触屏能用，光标停在原地。
+
+`assets/wlr_cursor_map.c` 现在在触摸坐标换算时藏起光标，下一次鼠标移动、点击或滚轮再把 cage 或客户程序设过的图像放回来。2026-10-11 用 headless cage 和一块 `ID_INPUT_TOUCHSCREEN` 的虚拟屏核对：只有鼠标时画面有 97 个非黑像素，一根手指和两根手指时是 0，随后一次相对鼠标移动回到 97。同一条路径上 `wlr_seat_touch_notify_down` 对两个触点各调了一次（id 0 在 639.7,359.7，id 1 在 266.5,133.2）。手写笔是另一件事：cage 0.3.1 对 `WLR_INPUT_DEVICE_TABLET` 直接丢掉，Sunshine 建的笔设备到不了客户程序。
+
+已经在跑的 cage 要重新 start 才加载新的垫片。
 
 ## 当前状态
 

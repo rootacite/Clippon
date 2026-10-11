@@ -10,6 +10,24 @@ from pathlib import Path
 
 from clippon.config import CURSOR_SHIM_PATH, SHIM_PATH
 
+# Qt's unix platform asks the session which desktop this is
+# (XDG_CURRENT_DESKTOP, else KDE_FULL_SESSION) and only then loads the KDE
+# platform theme. That plugin is what reads kdeglobals — colors, the icon
+# theme, the widget style and the fonts. clippond is a user service, so it
+# never received the variables Plasma imported into the user manager, and a
+# program it starts falls back to the built-in light palette.
+# These are the names Plasma itself puts in the session for that lookup.
+# Anything else in the user manager (PATH, the seat, the real display) stays
+# there.
+_DESKTOP_KEYS = (
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "DESKTOP_SESSION",
+    "KDE_FULL_SESSION",
+    "KDE_SESSION_VERSION",
+    "XDG_CONFIG_DIRS",
+)
+
 # cage starts its client as soon as the socket exists, so the mode is set from
 # inside that client, before the app itself runs. An app that only reads the
 # mode at startup would otherwise come up at wlroots' 1280x720 default.
@@ -42,12 +60,45 @@ def client_argv(command: tuple[str, ...], resolution: str) -> list[str]:
     ]
 
 
+def session_desktop_env() -> dict[str, str]:
+    """Desktop-identity variables from the systemd user manager.
+
+    Plasma imports them with `systemctl --user import-environment`. An empty
+    result (no user manager, or no graphical session yet) leaves the
+    environment alone.
+    """
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return {}
+    if proc.returncode != 0:
+        return {}
+    return desktop_keys(proc.stdout)
+
+
+def desktop_keys(text: str) -> dict[str, str]:
+    """The desktop-identity lines of a `systemctl show-environment` listing."""
+    found: dict[str, str] = {}
+    allowed = set(_DESKTOP_KEYS)
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key in allowed and value:
+            found[key] = value
+    return found
+
+
 def cage_environment(
     audio_env: dict[str, str],
     shim: Path = SHIM_PATH,
     cursor_shim: Path = CURSOR_SHIM_PATH,
     seat: str = "",
     extra: Mapping[str, str] | None = None,
+    session: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Environment for cage itself. The client wrapper drops LD_PRELOAD again.
 
@@ -59,10 +110,20 @@ def cage_environment(
     *extra* is what `--env` asked for. It beats the value inherited from the
     environment, and the entries set below still beat it in turn: the display,
     the audio socket and the shims stay this function's to decide.
+
+    *session* is the graphical session's desktop identity (see
+    `_DESKTOP_KEYS`). A name already present — inherited, or set with `--env` —
+    is kept. `start_cage` fills it from the user manager; an empty mapping
+    adds nothing.
     """
     env = os.environ.copy()
     if extra:
         env.update(extra)
+    desktop = session or {}
+    for key in _DESKTOP_KEYS:
+        value = desktop.get(key)
+        if value and key not in env:
+            env[key] = value
     env.pop("WAYLAND_DISPLAY", None)
     env.pop("DISPLAY", None)
     env.update(audio_env)
@@ -96,7 +157,9 @@ def start_cage(
 ) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         ["cage", "--", *client_argv(command, resolution)],
-        env=cage_environment(audio_env, shim, cursor_shim, seat, extra),
+        env=cage_environment(
+            audio_env, shim, cursor_shim, seat, extra, session_desktop_env()
+        ),
         stdout=log_file,  # type: ignore[arg-type]
         stderr=subprocess.STDOUT,
     )
