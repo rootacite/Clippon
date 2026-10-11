@@ -113,6 +113,17 @@ clipponctl list
 
 `clipponctl start` asks the user daemon to create the session; the daemon writes the per-session Sunshine configuration and the helper creates the namespace, the veth pair, the address and the port group before the compositor starts. `list` shows each session with its address, its base port, its pid and the command it runs. A session stops with `clipponctl stop alpha`.
 
+`--encoder` chooses that session's Sunshine video encoder: `vaapi`, `vulkan`, or `soft` (Sunshine's software encoder). The default is `vaapi`. The choice is written into that session's `sunshine.conf` as `encoder = vaapi`, `encoder = vulkan`, or `encoder = software`.
+
+`--quick` 套用一份预设，并且可以不写会话名。名字取命令的可执行文件名：`/usr/bin/dolphin` 得到 `dolphin`，`wlc /path/to/game.exe` 得到 `wlc`。名字写在选项前面时，仍用那个名字。
+
+```bash
+clipponctl start --quick -- dolphin
+clipponctl start alpha --quick -- /usr/bin/dolphin
+```
+
+预设的出厂内容是 `--res 1920x1080@120Hz`、四条 fcitx 变量（`GTK_IM_MODULE`、`QT_IM_MODULE`、`XMODIFIERS=@im=fcitx`、`SDL_IM_MODULE`）和 `--encoder vaapi`。同一条 `start` 上再写的 `--res`、`--env`、`--encoder` 只对这一次生效。`clipponctl set-quick` 不带参数时打印当前预设；带上的选项会改掉对应的那一项并保存。给出 `--env` 会换掉整组环境变量，不给则保留。配置在 `${XDG_CONFIG_HOME:-~/.config}/clippon/quick.json`，删掉这个文件就回到出厂预设。`set-quick` 不经过 `clippond`。文件名不符合 `[a-z][a-z0-9-]{0,11}` 时，把名字写在 `--quick` 前面。
+
 To run one session without the daemon, on the host network:
 
 ```bash
@@ -136,7 +147,9 @@ The application list then contains one entry per session, named after the sessio
 | Command | What it does |
 | --- | --- |
 | `clippon [--verbose] [--res AxB[@C[Hz]]] [--env K=V]... [--] <command>` | Run one session in the foreground, on the host network. |
-| `clipponctl start NAME [--verbose] [--res ...] [--env K=V]... [--] <command>` | Create a session in its own namespace and start it. |
+| `clipponctl start NAME [--verbose] [--res ...] [--encoder vaapi\|vulkan\|soft] [--env K=V]... [--] <command>` | Create a session in its own namespace and start it. |
+| `clipponctl start --quick [--res ...] [--encoder ...] [--env K=V]... [--] <command>` | Start with the saved preset. The session name is the command's file name unless a NAME is written first. |
+| `clipponctl set-quick [--res ...] [--encoder ...] [--env K=V]...` | Print the `--quick` preset, or replace the parts you name. |
 | `clipponctl list` | Sessions, their addresses, base ports, pids and commands. |
 | `clipponctl stop NAME` | Stop a session, its application and its audio stack. |
 | `clipponctl release NAME` | Stop what a session is running and forget the client sessions claiming it. |
@@ -170,6 +183,7 @@ A name given this way beats the same name in the daemon's environment. The sessi
 
 | Path | Contents |
 | --- | --- |
+| `${XDG_CONFIG_HOME:-~/.config}/clippon/quick.json` | The `--quick` preset. Absent means the built-in 1920x1080@120Hz, fcitx, vaapi preset. |
 | `~/.local/state/clippon/gateway/` | `identity.json`, the gateway's TLS material, and `clients.json` with the paired client certificates. |
 | `~/.local/state/clippon/instances/<name>/` | Per-session `sunshine.conf` and logs. |
 | `/run/user/<uid>/clippon/daemon.sock` | The user daemon's control socket. |

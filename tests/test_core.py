@@ -26,7 +26,7 @@ from clippon.config import (
     parse_args,
     resolution_ok,
 )
-from clippon.ctl import format_list, parse_ctl
+from clippon.ctl import format_list, main, parse_ctl
 from clippon.daemon import clippon_argv
 from clippon.gateway import (
     classify,
@@ -384,6 +384,7 @@ class InstanceLayoutTests(unittest.TestCase):
         self.assertEqual(meta["port"], 48989)
         # The default stays the first group, which the gateway also listens on.
         self.assertIn("port = 47989\n", sunshine_conf(root, "desk"))
+        self.assertIn("encoder = vaapi\n", sunshine_conf(root, "desk"))
 
 
 class PortTableTests(unittest.TestCase):
@@ -575,6 +576,59 @@ class CtlProtocolTests(unittest.TestCase):
         self.assertEqual(parsed["name"], "desk")
         self.assertEqual(parsed["command"], ["kitty", "-e", "sh"])
         self.assertEqual(parsed["resolution"], "1920x1080")
+        self.assertEqual(parsed["encoder"], "vaapi")
+
+    def test_encoder_defaults_to_vaapi_and_soft_is_software(self) -> None:
+        from clippon.daemon import _encoder
+
+        plain = parse_ctl(["start", "desk", "--", "kitty"], environ={"HOME": "/home/me"})
+        self.assertEqual(plain["encoder"], "vaapi")
+        self.assertEqual(_encoder(plain["encoder"]), "vaapi")
+        soft = parse_ctl(
+            ["start", "desk", "--encoder", "soft", "--res", "1280x720", "--", "kitty"],
+            environ={"HOME": "/home/me"},
+        )
+        self.assertEqual(soft["encoder"], "soft")
+        self.assertEqual(soft["resolution"], "1280x720")
+        self.assertEqual(_encoder("soft"), "software")
+        vulkan = parse_ctl(
+            ["start", "desk", "--encoder=vulkan", "--", "true"],
+            environ={"HOME": "/home/me"},
+        )
+        self.assertEqual(vulkan["encoder"], "vulkan")
+        later = parse_ctl(
+            ["start", "desk", "--encoder", "vaapi", "--encoder", "soft", "--", "true"],
+            environ={"HOME": "/home/me"},
+        )
+        self.assertEqual(later["encoder"], "soft")
+        for argv in (
+            ["start", "desk", "--encoder", "nvenc", "--", "true"],
+            ["start", "desk", "--encoder"],
+            ["start", "desk", "--encoder="],
+        ):
+            with self.assertRaises(ClipponError):
+                parse_ctl(argv, environ={"HOME": "/home/me"})
+        with self.assertRaises(ClipponError):
+            _encoder("software")
+
+    def test_the_chosen_encoder_is_written_into_sunshine_conf(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_instance(
+                root,
+                "desk",
+                ["sleep", "30"],
+                "1280x720",
+                "cage-sink",
+                "enabled",
+                "auto",
+                False,
+                encoder="software",
+            )
+            text = (root / "sunshine.conf").read_text(encoding="utf-8")
+            meta = json_apps(root / "meta.json")
+        self.assertIn("encoder = software\n", text)
+        self.assertEqual(meta["encoder"], "software")
 
     def test_list_hide_expose_stop(self) -> None:
         self.assertEqual(parse_ctl(["list"]), {"op": "list"})
@@ -615,6 +669,144 @@ class CtlProtocolTests(unittest.TestCase):
         self.assertIn("web", text)
         self.assertIn("48989", text)
         self.assertIn("10.200.0.3", text)
+
+
+class QuickPresetTests(unittest.TestCase):
+    """`--quick` expands a saved preset and names the session after the program."""
+
+    def _env(self, directory: str) -> dict[str, str]:
+        return {"HOME": directory, "XDG_CONFIG_HOME": directory}
+
+    def test_quick_uses_the_builtin_preset_and_the_executable_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = self._env(directory)
+            request = parse_ctl(["start", "--quick", "--", "/usr/bin/dolphin"], environ=env)
+        self.assertEqual(request["name"], "dolphin")
+        self.assertEqual(request["command"], ["/usr/bin/dolphin"])
+        self.assertEqual(request["resolution"], "1920x1080@120Hz")
+        self.assertEqual(request["encoder"], "vaapi")
+        self.assertEqual(
+            request["env"],
+            {
+                "GTK_IM_MODULE": "fcitx",
+                "QT_IM_MODULE": "fcitx",
+                "XMODIFIERS": "@im=fcitx",
+                "SDL_IM_MODULE": "fcitx",
+            },
+        )
+        self.assertFalse((Path(directory) / "clippon" / "quick.json").exists())
+
+    def test_a_launcher_is_named_after_its_own_file_not_the_game(self) -> None:
+        request = parse_ctl(
+            ["start", "--quick", "--", "wlc", "/path/to/game.exe"],
+            environ={"HOME": "/home/me", "XDG_CONFIG_HOME": "/home/me/.config"},
+        )
+        self.assertEqual(request["name"], "wlc")
+        self.assertEqual(request["command"], ["wlc", "/path/to/game.exe"])
+
+    def test_an_explicit_name_wins_and_flags_override_the_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = {
+                **self._env(directory),
+                "STREAM_RES": "800x600",
+            }
+            request = parse_ctl(
+                [
+                    "start",
+                    "alpha",
+                    "--quick",
+                    "--res",
+                    "1280x720",
+                    "--encoder",
+                    "soft",
+                    "--env",
+                    "GTK_IM_MODULE=ibus",
+                    "--env",
+                    "EXTRA=1",
+                    "--",
+                    "/usr/bin/dolphin",
+                ],
+                environ=env,
+            )
+        self.assertEqual(request["name"], "alpha")
+        self.assertEqual(request["resolution"], "1280x720")
+        self.assertEqual(request["encoder"], "soft")
+        self.assertEqual(request["env"]["GTK_IM_MODULE"], "ibus")
+        self.assertEqual(request["env"]["QT_IM_MODULE"], "fcitx")
+        self.assertEqual(request["env"]["EXTRA"], "1")
+
+    def test_without_quick_the_preset_and_the_name_rule_stay_out(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = {**self._env(directory), "STREAM_RES": "800x600@60"}
+            parse_ctl(
+                ["set-quick", "--res", "640x480", "--encoder", "vulkan"],
+                environ=env,
+            )
+            plain = parse_ctl(["start", "desk", "--", "kitty"], environ=env)
+        self.assertEqual(plain["name"], "desk")
+        self.assertEqual(plain["resolution"], "800x600@60")
+        self.assertEqual(plain["encoder"], "vaapi")
+        self.assertEqual(plain["env"], {})
+
+    def test_a_name_the_filename_cannot_be_is_refused(self) -> None:
+        for command in ("hamidashitotsu", "Game.exe", "/usr/bin/Dolphin"):
+            with self.assertRaises(ClipponError) as caught:
+                parse_ctl(["start", "--quick", "--", command], environ={"HOME": "/home/me"})
+            self.assertIn("pass a name before --quick", str(caught.exception))
+        with self.assertRaises(ClipponError):
+            parse_ctl(["start", "--quick"], environ={"HOME": "/home/me"})
+        with self.assertRaises(ClipponError):
+            parse_ctl(["start", "--", "kitty"], environ={"HOME": "/home/me"})
+        with self.assertRaises(ClipponError):
+            parse_ctl(["start", "--quick=1", "--", "true"], environ={"HOME": "/home/me"})
+
+    def test_set_quick_prints_merges_and_does_not_call_the_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = self._env(directory)
+            with redirect_stdout(io.StringIO()) as shown:
+                code = main(["set-quick"], environ=env)
+            self.assertEqual(code, 0)
+            text = shown.getvalue().strip()
+            self.assertIn("--res 1920x1080@120Hz", text)
+            self.assertIn("--env GTK_IM_MODULE=fcitx", text)
+            self.assertIn("--env XMODIFIERS=@im=fcitx", text)
+            self.assertIn("--encoder vaapi", text)
+            self.assertFalse((Path(directory) / "clippon" / "quick.json").exists())
+
+            with redirect_stdout(io.StringIO()) as saved:
+                code = main(["set-quick", "--encoder", "soft"], environ=env)
+            self.assertEqual(code, 0)
+            self.assertIn("--encoder soft", saved.getvalue())
+            self.assertIn("--env QT_IM_MODULE=fcitx", saved.getvalue())
+            path = Path(directory) / "clippon" / "quick.json"
+            self.assertTrue(path.is_file())
+
+            request = parse_ctl(["start", "--quick", "--", "dolphin"], environ=env)
+            self.assertEqual(request["encoder"], "soft")
+            self.assertEqual(request["resolution"], "1920x1080@120Hz")
+            self.assertEqual(request["env"]["SDL_IM_MODULE"], "fcitx")
+
+            replaced = parse_ctl(
+                ["set-quick", "--env", "GTK_IM_MODULE=ibus", "--env", "GTK_IM_MODULE=fcitx"],
+                environ=env,
+            )
+            self.assertEqual(replaced["text"].count("--env"), 1)
+            again = parse_ctl(["start", "--quick", "--", "dolphin"], environ=env)
+            self.assertEqual(again["env"], {"GTK_IM_MODULE": "fcitx"})
+
+    def test_a_broken_preset_file_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = self._env(directory)
+            path = Path(directory) / "clippon" / "quick.json"
+            path.parent.mkdir(parents=True)
+            path.write_text("{", encoding="utf-8")
+            with self.assertRaises(ClipponError):
+                parse_ctl(["start", "--quick", "--", "dolphin"], environ=env)
+            path.write_text('{"resolution": "1080p", "env": [], "encoder": "vaapi"}\n', encoding="utf-8")
+            with self.assertRaises(ClipponError):
+                parse_ctl(["set-quick"], environ=env)
+        with self.assertRaises(ClipponError):
+            parse_ctl(["set-quick", "dolphin"], environ={"HOME": "/home/me", "XDG_CONFIG_HOME": "/home/me/.config"})
 
 
 class SpawnCommandTests(unittest.TestCase):

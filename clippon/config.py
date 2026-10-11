@@ -90,6 +90,7 @@ class Config:
     log_dir: Path
     instance: str = ""
     env: tuple[tuple[str, str], ...] = ()
+    resolution_set: bool = False
     shim: Path = SHIM_PATH
     addr_shim: Path = ADDR_SHIM_PATH
     cursor_shim: Path = CURSOR_SHIM_PATH
@@ -217,4 +218,5 @@ def parse_args(argv: list[str], environ: Mapping[str, str] | None = None) -> Con
         log_dir=log_dir,
         instance=instance,
         env=tuple(extra),
+        resolution_set=res_set,
     )

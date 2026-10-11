@@ -268,6 +268,10 @@ Artemis 的多点触控模式把手指发给主机的触摸通道，不移动鼠
 
 已经在跑的 cage 要重新 start 才加载新的垫片。
 
+### 十七、`--quick` 与 `set-quick`
+
+`clipponctl start --quick` 可以不写会话名。名字是命令的可执行文件名，`/usr/bin/dolphin` 得到 `dolphin`，`wlc /path/to/game.exe` 得到 `wlc`。选项前面若写了名字，用那个名字。分辨率、环境变量和编码器来自 `${XDG_CONFIG_HOME:-~/.config}/clippon/quick.json`；没有这个文件时用 `--res 1920x1080@120Hz`、`GTK_IM_MODULE`、`QT_IM_MODULE`、`XMODIFIERS=@im=fcitx`、`SDL_IM_MODULE` 四条 fcitx 变量，以及 `--encoder vaapi`。同一条命令上的 `--res`、`--env`、`--encoder` 只覆盖这一次。`clipponctl set-quick` 不带参数时打印预设；带参数时只改写到的那一项，其中出现的 `--env` 替换整组环境变量。这条命令只读写配置文件，不经过 `clippond`。
+
 ## 当前状态
 
 - `clippon-net` 与 `clippond` 都在运行（`clippon-net` 与 `clippond` 各重启过一次以加载本次改动）。

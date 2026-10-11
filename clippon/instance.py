@@ -13,6 +13,24 @@ from clippon.ports import BASE_PORT
 # vb-<name> must fit in IFNAMSIZ-1 (15). "vb-" is three characters.
 _NAME = re.compile(r"[a-z][a-z0-9-]{0,11}")
 
+# What `clipponctl start --encoder` accepts, and the name Sunshine's `encoder`
+# key uses. "soft" is the CLI word; Sunshine calls that backend "software".
+ENCODERS = {
+    "vaapi": "vaapi",
+    "vulkan": "vulkan",
+    "soft": "software",
+}
+DEFAULT_ENCODER = "vaapi"
+
+
+def sunshine_encoder(choice: str) -> str:
+    """The Sunshine `encoder` value for one `--encoder` argument."""
+    mapped = ENCODERS.get(choice)
+    if mapped is None:
+        names = ", ".join(ENCODERS)
+        raise ValueError(f"encoder must be one of {names} (got {choice!r})")
+    return mapped
+
 
 def validate_name(name: str) -> None:
     if _NAME.fullmatch(name) is None:
@@ -63,13 +81,16 @@ def sunshine_conf(
     cert: Path | None = None,
     key: Path | None = None,
     port: int = BASE_PORT,
+    encoder: str = "vaapi",
 ) -> str:
     """Absolute paths so two instances never share apps or state.
 
     The server certificate may be the gateway's, so Moonlight's pinned
     identity and the certificate inside pairing answers are the same one.
     *port* is this instance's own base port; the rest of its ports are offsets
-    from it, which is what lets several instances listen at once.
+    from it, which is what lets several instances listen at once. *encoder* is
+    a Sunshine backend name (`vaapi`, `vulkan` or `software`), already mapped
+    from the `--encoder` argument.
     """
     apps = directory / "apps.json"
     state = directory / "sunshine_state.json"
@@ -78,6 +99,7 @@ def sunshine_conf(
     log = directory / "sunshine.log"
     return (
         f"port = {port}\n"
+        f"encoder = {encoder}\n"
         f"address_family = ipv4\n"
         f"upnp = disabled\n"
         f"sunshine_name = {name}\n"
@@ -114,6 +136,7 @@ def meta_document(
     tray: str,
     verbose: bool,
     port: int = BASE_PORT,
+    encoder: str = "vaapi",
 ) -> str:
     return json.dumps(
         {
@@ -124,6 +147,7 @@ def meta_document(
             "tray": tray,
             "verbose": verbose,
             "port": port,
+            "encoder": encoder,
         },
         indent=2,
     ) + "\n"
@@ -141,16 +165,17 @@ def write_instance(
     cert: Path | None = None,
     key: Path | None = None,
     port: int = BASE_PORT,
+    encoder: str = "vaapi",
 ) -> None:
     validate_name(name)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "sunshine.conf").write_text(
-        sunshine_conf(directory, name, cert, key, port),
+        sunshine_conf(directory, name, cert, key, port, encoder),
         encoding="utf-8",
     )
     (directory / "apps.json").write_text(apps_document(name), encoding="utf-8")
     (directory / "meta.json").write_text(
-        meta_document(command, resolution, sink, audio, tray, verbose, port),
+        meta_document(command, resolution, sink, audio, tray, verbose, port, encoder),
         encoding="utf-8",
     )
 

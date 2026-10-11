@@ -16,7 +16,14 @@ from pathlib import Path
 
 from clippon.config import DEFAULT_SINK, ClipponError
 from clippon.front import ensure_identity, instance_certificate, open_front, trust_instance
-from clippon.instance import instance_dir, read_meta, state_home, validate_name, write_instance
+from clippon.instance import (
+    instance_dir,
+    read_meta,
+    state_home,
+    sunshine_encoder,
+    validate_name,
+    write_instance,
+)
 from clippon.log import error, note, setup_logging
 from clippon.ports import BASE_PORT, base_port_ok
 from clippon.sunshine import managed_tray
@@ -160,6 +167,7 @@ class Daemon:
         tray = managed_tray(requested)
         verbose = bool(request.get("verbose"))
         extra = _env_map(request.get("env"))
+        encoder = _encoder(request.get("encoder", "vaapi"))
         status = self._call({"op": "status"})
         raw = status.get("instances")
         if isinstance(raw, dict) and name in raw:
@@ -190,6 +198,7 @@ class Daemon:
                 cert=cert,
                 key=key,
                 port=port,
+                encoder=encoder,
             )
             trust_instance(directory, identity, name)
             log_path.touch(exist_ok=True)
@@ -225,7 +234,7 @@ class Daemon:
         lan = listed.get("lan") if isinstance(listed.get("lan"), list) else []
         return {
             "ok": True,
-            "message": f"started {name} pid {pid} at {ip}, ports from {port}",
+            "message": f"started {name} pid {pid} at {ip}, ports from {port}, encoder {encoder}",
             "name": name,
             "pid": pid,
             "ip": ip,
@@ -300,6 +309,16 @@ class Daemon:
 
     def _on_signal(self, _signum: int, _frame: object) -> None:
         self._stop = True
+
+
+def _encoder(value: object) -> str:
+    """Map a start request's `--encoder` word onto Sunshine's config value."""
+    if not isinstance(value, str):
+        raise ClipponError("encoder must be a string")
+    try:
+        return sunshine_encoder(value)
+    except ValueError as exc:
+        raise ClipponError(str(exc)) from exc
 
 
 def _child_env(sink: str, audio: str, tray: str, extra: dict[str, str]) -> dict[str, str]:
