@@ -209,13 +209,54 @@ clippon --env PROBE=frontend -- sh -c 'env > /tmp/...'
 
 第一次探测之所以“看起来生效”，是因为当时 `clippond` 还是 22:22 启动的旧进程，而那些变量本来就在它的环境里；重启服务之后才验出了真正的差异。
 
+### 十四、多个实例同时串流
+
+按 `docs/DESIGN-multi-session.md` 实施。此前每个实例都有自己的 netns，但宿主上只有一组 GameStream 端口，靠"切换"把这一组 DNAT 指向当前那一台，所以同一时刻只能有一路。现在两块都改了：
+
+**每实例一组端口。** Sunshine 的 base port 可配（`src/config.cpp` 的 `int_between_f(..., {1024 + nvhttp::PORT_HTTPS, 65535 - rtsp_stream::RTSP_SETUP_PORT})`，即 `1019..65514`），其余端口都是它的固定偏移（HTTP +0、HTTPS −5、Web UI +1、视频 UDP +9、控制 +10、音频 +11、RTSP +21；`src/stream.h`、`src/rtsp.h`、`src/nvhttp.h`、`src/confighttp.h`）。
+
+- `clippon/ports.py`：新增 `PortGroup`（由 base 推出整组端口）与 `allocate_base_port()`，组间隔 1000（`47989`、`48989`、`49989`…）。
+- helper 在 `create()` 里分配 base 并记进实例记录（`/var/lib/clippon/state.json` 的 `port` 字段），`clipponctl start` 拿到之后写进该实例的 `sunshine.conf`（`port = <base>`）与 `meta.json`。旧记录没有 `port` 时，helper 启动对账会给它补一个。
+- `nft_table()` 从"一组随时切换"改成"每实例一组静态 DNAT"：每个实例各写 `tcp dport {base+21}` 与 `udp dport {base+9,+10,+11}` → 它自己的 `10.200.0.N`，`output` 链同理。`expose`/`hide` 不再动任何 DNAT，只决定 47990 的 Web UI 代理指向谁。
+- 网关访问后端时按该实例的 base 计算（`front.py` 的 `Backend.ports`）。
+
+**网关按客户端回答。** 客户端读到的 `currentgame`/`state` 是网关自己写的，所以可以每个客户端写一份：
+
+- `clippon/sessions.py`：`指纹 -> 实例` 的会话表。`/launch`、`/resume` 转发成功后写入，`/cancel` 成功后删除，回答 `serverinfo` 时对账——后端已经不报这个应用就把记录清掉，客户端异常退出也不会永久占用。
+- `/serverinfo`：已配对（HTTPS，带客户端证书）的请求只报它自己那条记录，没有记录就是 `SUNSHINE_SERVER_FREE`。这一步是必须的：`quitApp()` 在 `/cancel` 之后还会再查一次 `serverinfo`（`nvhttp.cpp:249-269`），网关若因别的实例在跑而继续报 BUSY，客户端会以为自己退不掉、抛 599。明文 47989 没有证书，保持原来的全局回答（配对前才走这条路）。
+- `/applist`：别的客户端正在串的实例从列表里去掉（`merge_applists(hidden=...)`），id 仍然留在路由表里，所以客户端拿缓存的旧 id 来点也能得到明确回答。
+- `/launch`：目标实例被别人占用就回 `503 another client is already streaming this application`，不转发；只有残留应用挡路时先向该后端发一次 `/cancel` 再转发，让重复启动幂等——没有 `cmd` 的 placebo 应用不会自己结束。`clipponctl release NAME` 是手动版：停掉该实例的应用并丢掉所有认领它的会话记录。
+
+顺带核实的客户端源码事实：`getServerInfo()` 在有 pin 过的服务端证书时优先走 HTTPS（`app/backend/nvhttp.cpp:134-190`），`getAppList()` 也只走 HTTPS（`app/backend/nvhttp.cpp:301-306`），所以这两条路径都带着客户端证书，网关能分辨是谁；`currentGameId` 决定客户端发 `/resume` 还是 `/launch`（`app/streaming/session.cpp:1614`），一个 Moonlight 进程只有一个会话（`app/streaming/session.cpp:66-67`）。
+
+验证（2026-10-11 07:52–08:00，本机两个 moonlight-qt 客户端各自在一个实例的 cage 里，`XDG_CONFIG_HOME` 分开，用真实配对流程拿到两张不同的客户端证书）：
+
+```text
+clipponctl list            alpha 10.200.0.2 base 47989 / beta 10.200.0.3 base 48989
+netns 内监听               alpha: 47984 47989 47990 48010   beta: 48984 48989 48990 49010
+nft                       tcp dport 48010 -> .2, 49010 -> .3; udp 47998/99/48000 -> .2, 48998/99/49000 -> .3
+客户端 A 串 alpha、B 串 beta  两边同时 CLIENT CONNECTED，两个客户端都解出画面并收到音频包
+                            conntrack: 客户端->192.168.4.4:48010 译到 .2；->192.168.4.4:49010 译到 .3
+A 的 serverinfo            currentgame=462510448 state=SUNSHINE_SERVER_BUSY
+B 的 serverinfo            currentgame=99903777  state=SUNSHINE_SERVER_BUSY
+B 的 applist               只有 beta（alpha 被 A 占着）；A 的 applist 只有 alpha
+A 点 beta                  HTTP 503 another client is already streaming this application
+强杀 A 的客户端             alpha 后端仍报 BUSY（placebo），A 的 serverinfo 也仍报 BUSY
+clipponctl release alpha   后端 currentgame=0，A 的 serverinfo 归零，B 的 applist 恢复两条
+强杀 B 的客户端后 B 发 /cancel  /cancel 按会话表路由到 beta（此时没有 expose），后端归零
+网关重启后再串 alpha        日志 "alpha still reports an app; cancelling it first" 之后正常开始
+47990 代理                expose beta -> 307（beta 的 Web UI），hide -> 连接被关
+```
+
+两个实例的实时封面、输入座椅、私有音频都沿用原有机制，未改动。单元测试 74 项通过。
+
 ## 当前状态
 
-- `clippon-net` 与 `clippond` 都在运行。
-- `alpha`（10.200.0.2）与 `beta`（10.200.0.3）各自在自己的 netns 里，端口互不冲突。
-- 网关在另一台机器的 Moonlight 上表现为一台主机，应用列表里是 `alpha` 和 `beta`，两个都能打开，指针和键盘正常。
+- `clippon-net` 与 `clippond` 都在运行（`clippon-net` 与 `clippond` 各重启过一次以加载本次改动）。
+- 目前没有正在运行的实例；验证用的两个临时客户端（`/tmp/ml-a`、`/tmp/ml-b`）与它们的证书已经删掉，`clients.json` 复原成原来的 10 条。
+- 网关在另一台机器的 Moonlight 上表现为一台主机，应用列表里每个实例一条；同机两个客户端可以同时各串一路（见十四）。
 - 封面是这个实例的实时截图（见十二）；客户端把封面缓存到磁盘，旧客户端要清一次缓存。
-- 单元测试 66 项通过。
+- 单元测试 74 项通过。
 
 ## 目录
 

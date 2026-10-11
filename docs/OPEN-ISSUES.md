@@ -134,13 +134,23 @@ alpha  http://10.200.0.2:47989/serverinfo   currentgame=994642064  state=SUNSHIN
 beta   http://10.200.0.3:47989/serverinfo   currentgame=0          state=SUNSHINE_SERVER_FREE
 ```
 
-直接后果：Moonlight 的主机项长期显示"正在运行某个应用"，`serverinfo` 的 `currentgame` 也不再归零。真正会出错的情形是 `/launch`：Sunshine 在已有应用运行时拒绝启动，返回 `An app is already running on this host`（`src/nvhttp.cpp:1376-1380`）。客户端按自己缓存的 `currentGameId` 决定发 `/launch` 还是 `/resume`，缓存过期时就会撞上这个拒绝。
+2026-10-11 起网关从两侧都做了处理（见 `docs/WORKLOG.md` 十四）：
 
-两条处理路子：
+- **启动时幂等**：`/launch` 命中某个后端时，如果该后端 `currentgame > 0` 且占用它的不是别的客户端，先向它发一次 `/cancel` 再转发，重复启动不再撞上 `An app is already running on this host`。实测日志 `alpha still reports an app; cancelling it first`（网关重启后客户端再串同一实例）。
+- **手动释放**：`clipponctl release NAME` 停掉该实例的应用并丢掉所有认领它的会话记录。
+- 代价：客户端硬断线后、下一次启动或 release 之前，该实例对它自己仍报 BUSY（客户端看到"运行中"，会发 `/resume`，能正常接上），对其他客户端则从应用列表里消失，点缓存里的旧条目会得到 503。
 
-- 客户端侧，零代码：在 Moonlight 设置里打开"会话结束后退出应用"（`quitAppAfter`），优雅退出时就会发 `/cancel`，网关照原样转发给对应后端。硬断线仍然不会发。
-- 网关侧，加固：`/launch` 命中某个后端时，如果该后端 `currentgame > 0`，先向它发一次 `/cancel` 再转发，让重复启动变成幂等。这条不需要新的存活探测。
-- 更彻底的：用 nft 计数器之类的内核侧信号判断流是否真的活着，不活跃就自动收掉后端。需要 helper 增加计数器操作。
+仍然敞着的一条：**占用判定依赖后端报告，没有内核侧的存活信号**。客户端硬断线后应用不算结束，实例会被一直占着，直到有人 `release` 或重新启动它。替代方案是用 nft 计数器判断流是否真的活着，需要 helper 增加计数器操作。
+
+客户端侧零代码的缓解仍在：`quitAppAfter` 打开后，优雅退出会发 `/cancel`。硬断线无论如何都不会发。
+
+### 被隐藏的实例在客户端上要等一次列表刷新
+
+客户端会把主机身份与 applist 落盘（`app/backend/nvcomputer.cpp:96-105`，uuid 在 `:29`），被占用状态的变化要等那台设备重新进主机（或列表轮询）时才刷新。这个延迟可以接受，但要知道它存在：占用期间别的客户端看到的列表里少了那一条，释放之后又会回来。
+
+### 一个实例只由一个客户端串
+
+同一个 Application 同时只允许一个客户端串。第二个客户端的 `/launch` 会被网关以 503 拒掉（提示 `another client is already streaming this application`），同时该实例对它隐藏。这是有意的（对应"不抢占别人正在跑的应用"），不是待修项。
 
 ## 工具
 
